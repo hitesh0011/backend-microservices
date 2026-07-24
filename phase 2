@@ -1,0 +1,1130 @@
+Phase 2: Room Service (staynest-room-service)
+Dependencies in STS: Spring Web, Spring Data JPA, MySQL Driver, Spring Security, Eureka Discovery Client, OpenFeign, Lombok, Validation
+Manual JWT dependencies (same as IAM service — copy jjwt-api, jjwt-impl, jjwt-jackson to pom.xml)
+application.yml:
+yaml
+
+server:
+  port: 8082
+
+spring:
+  application:
+    name: room-service
+  datasource:
+    url: jdbc:mysql://localhost:3306/staynest_room_db?createDatabaseIfNotExist=true&useSSL=false&serverTimezone=UTC
+    username: root
+    password: root
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQL8Dialect
+        format_sql: true
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+jwt:
+  secret: staynest-secret-key-for-jwt-signing-2026
+  expiration: 86400000
+
+Enums
+RoomTypeName.java (com.staynest.room.enums)
+java
+
+package com.staynest.room.enums;
+
+public enum RoomTypeName {
+    STANDARD,
+    DELUXE,
+    SUITE,
+    VILLA
+}
+
+RoomStatus.java (com.staynest.room.enums)
+java
+
+package com.staynest.room.enums;
+
+public enum RoomStatus {
+    AVAILABLE,
+    OCCUPIED,
+    CLEANING,
+    MAINTENANCE,
+    BLOCKED
+}
+
+RatePlanName.java (com.staynest.room.enums)
+java
+
+package com.staynest.room.enums;
+
+public enum RatePlanName {
+    RACK,
+    CORPORATE,
+    SEASONAL,
+    PROMO
+}
+
+RatePlanStatus.java (com.staynest.room.enums)
+java
+
+package com.staynest.room.enums;
+
+public enum RatePlanStatus {
+    ACTIVE,
+    INACTIVE
+}
+
+JWT Files (Copy from IAM Service, same package structure)
+Copy JwtUtil.java, JwtFilter.java, SecurityConfig.java into com.staynest.room.jwt and com.staynest.room.config — identical code, just change package names.
+Exceptions (Copy from IAM Service)
+ResourceNotFoundException.java, BadRequestException.java, GlobalExceptionHandler.java — identical code, packages: com.staynest.room.exception
+DTOs
+ApiResponse.java — identical to IAM (package: com.staynest.room.dto)
+RoomTypeRequest.java (com.staynest.room.dto)
+java
+
+package com.staynest.room.dto;
+
+import com.staynest.room.enums.RoomTypeName;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
+import lombok.Data;
+
+import java.math.BigDecimal;
+
+@Data
+public class RoomTypeRequest {
+    @NotNull
+    private RoomTypeName name;
+    @NotBlank
+    private String bedConfiguration;
+    @NotNull @Positive
+    private Integer maxOccupancy;
+    @NotNull @Positive
+    private BigDecimal baseRate;
+    private String amenitiesList;
+}
+
+RoomTypeResponse.java (com.staynest.room.dto)
+java
+
+package com.staynest.room.dto;
+
+import com.staynest.room.enums.RoomTypeName;
+import com.staynest.room.enums.RatePlanStatus;
+import lombok.Builder;
+import lombok.Data;
+
+import java.math.BigDecimal;
+
+@Data
+@Builder
+public class RoomTypeResponse {
+    private Integer roomTypeId;
+    private RoomTypeName name;
+    private String bedConfiguration;
+    private Integer maxOccupancy;
+    private BigDecimal baseRate;
+    private String amenitiesList;
+    private RatePlanStatus status;
+}
+
+RoomRequest.java (com.staynest.room.dto)
+java
+
+package com.staynest.room.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
+import lombok.Data;
+
+@Data
+public class RoomRequest {
+    @NotBlank
+    private String roomNumber;
+    @NotNull @Positive
+    private Integer floor;
+    @NotNull
+    private Integer roomTypeId;
+}
+
+RoomResponse.java (com.staynest.room.dto)
+java
+
+package com.staynest.room.dto;
+
+import com.staynest.room.enums.RoomStatus;
+import lombok.Builder;
+import lombok.Data;
+
+@Data
+@Builder
+public class RoomResponse {
+    private Integer roomId;
+    private String roomNumber;
+    private Integer floor;
+    private Integer roomTypeId;
+    private String roomTypeName;
+    private RoomStatus status;
+}
+
+RatePlanRequest.java (com.staynest.room.dto)
+java
+
+package com.staynest.room.dto;
+
+import com.staynest.room.enums.RatePlanName;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
+import lombok.Data;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+
+@Data
+public class RatePlanRequest {
+    @NotNull
+    private Integer roomTypeId;
+    @NotNull
+    private RatePlanName name;
+    @NotNull @Positive
+    private BigDecimal pricePerNight;
+    @NotNull
+    private LocalDate validFrom;
+    @NotNull
+    private LocalDate validTo;
+    private Boolean mealPlanIncluded;
+}
+
+RatePlanResponse.java (com.staynest.room.dto)
+java
+
+package com.staynest.room.dto;
+
+import com.staynest.room.enums.RatePlanName;
+import com.staynest.room.enums.RatePlanStatus;
+import lombok.Builder;
+import lombok.Data;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+
+@Data
+@Builder
+public class RatePlanResponse {
+    private Integer ratePlanId;
+    private Integer roomTypeId;
+    private String roomTypeName;
+    private RatePlanName name;
+    private BigDecimal pricePerNight;
+    private LocalDate validFrom;
+    private LocalDate validTo;
+    private Boolean mealPlanIncluded;
+    private RatePlanStatus status;
+}
+
+Entities
+RoomType.java (com.staynest.room.entity)
+java
+
+package com.staynest.room.entity;
+
+import com.staynest.room.enums.RatePlanStatus;
+import com.staynest.room.enums.RoomTypeName;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "room_types")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class RoomType {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "RoomTypeID")
+    private Integer roomTypeId;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Name", nullable = false)
+    private RoomTypeName name;
+
+    @Column(name = "BedConfiguration", length = 100)
+    private String bedConfiguration;
+
+    @Column(name = "MaxOccupancy", nullable = false)
+    private Integer maxOccupancy;
+
+    @Column(name = "BaseRate", nullable = false, precision = 10, scale = 2)
+    private BigDecimal baseRate;
+
+    @Column(name = "AmenitiesList", columnDefinition = "TEXT")
+    private String amenitiesList;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Status", nullable = false)
+    @Builder.Default
+    private RatePlanStatus status = RatePlanStatus.ACTIVE;
+
+    @CreationTimestamp
+    @Column(name = "CreatedAt", updatable = false)
+    private LocalDateTime createdAt;
+
+    @UpdateTimestamp
+    @Column(name = "UpdatedAt")
+    private LocalDateTime updatedAt;
+}
+
+Room.java (com.staynest.room.entity)
+java
+
+package com.staynest.room.entity;
+
+import com.staynest.room.enums.RoomStatus;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "rooms")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class Room {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "RoomID")
+    private Integer roomId;
+
+    @Column(name = "RoomNumber", nullable = false, unique = true, length = 10)
+    private String roomNumber;
+
+    @Column(name = "Floor", nullable = false)
+    private Integer floor;
+
+    @ManyToOne
+    @JoinColumn(name = "RoomTypeID", nullable = false)
+    private RoomType roomType;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Status", nullable = false)
+    @Builder.Default
+    private RoomStatus status = RoomStatus.AVAILABLE;
+
+    @CreationTimestamp
+    @Column(name = "CreatedAt", updatable = false)
+    private LocalDateTime createdAt;
+
+    @UpdateTimestamp
+    @Column(name = "UpdatedAt")
+    private LocalDateTime updatedAt;
+}
+
+RatePlan.java (com.staynest.room.entity)
+java
+
+package com.staynest.room.entity;
+
+import com.staynest.room.enums.RatePlanName;
+import com.staynest.room.enums.RatePlanStatus;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "rate_plans")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class RatePlan {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "RatePlanID")
+    private Integer ratePlanId;
+
+    @ManyToOne
+    @JoinColumn(name = "RoomTypeID", nullable = false)
+    private RoomType roomType;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Name", nullable = false)
+    private RatePlanName name;
+
+    @Column(name = "PricePerNight", nullable = false, precision = 10, scale = 2)
+    private BigDecimal pricePerNight;
+
+    @Column(name = "ValidFrom", nullable = false)
+    private LocalDate validFrom;
+
+    @Column(name = "ValidTo", nullable = false)
+    private LocalDate validTo;
+
+    @Column(name = "MealPlanIncluded")
+    @Builder.Default
+    private Boolean mealPlanIncluded = false;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Status", nullable = false)
+    @Builder.Default
+    private RatePlanStatus status = RatePlanStatus.ACTIVE;
+
+    @CreationTimestamp
+    @Column(name = "CreatedAt", updatable = false)
+    private LocalDateTime createdAt;
+
+    @UpdateTimestamp
+    @Column(name = "UpdatedAt")
+    private LocalDateTime updatedAt;
+}
+
+HospitalityReport.java (com.staynest.room.entity)
+java
+
+package com.staynest.room.entity;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "hospitality_reports")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class HospitalityReport {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "ReportID")
+    private Integer reportId;
+
+    @Column(name = "Scope", nullable = false, length = 50)
+    private String scope;
+
+    @Column(name = "Metrics", columnDefinition = "TEXT")
+    private String metrics;
+
+    @CreationTimestamp
+    @Column(name = "GeneratedDate", updatable = false)
+    private LocalDateTime generatedDate;
+}
+
+Repositories
+RoomTypeRepository.java (com.staynest.room.repository)
+java
+
+package com.staynest.room.repository;
+
+import com.staynest.room.entity.RoomType;
+import com.staynest.room.enums.RatePlanStatus;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface RoomTypeRepository extends JpaRepository<RoomType, Integer> {
+    List<RoomType> findByStatus(RatePlanStatus status);
+}
+
+RoomRepository.java (com.staynest.room.repository)
+java
+
+package com.staynest.room.repository;
+
+import com.staynest.room.entity.Room;
+import com.staynest.room.enums.RoomStatus;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface RoomRepository extends JpaRepository<Room, Integer> {
+    List<Room> findByStatus(RoomStatus status);
+    List<Room> findByRoomType_RoomTypeId(Integer roomTypeId);
+    List<Room> findByFloor(Integer floor);
+}
+
+RatePlanRepository.java (com.staynest.room.repository)
+java
+
+package com.staynest.room.repository;
+
+import com.staynest.room.entity.RatePlan;
+import com.staynest.room.enums.RatePlanStatus;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.time.LocalDate;
+import java.util.List;
+
+@Repository
+public interface RatePlanRepository extends JpaRepository<RatePlan, Integer> {
+    List<RatePlan> findByRoomType_RoomTypeId(Integer roomTypeId);
+    List<RatePlan> findByStatus(RatePlanStatus status);
+    List<RatePlan> findByRoomType_RoomTypeIdAndStatusAndValidFromLessThanEqualAndValidToGreaterThanEqual(
+            Integer roomTypeId, RatePlanStatus status, LocalDate checkIn, LocalDate checkOut);
+}
+
+HospitalityReportRepository.java (com.staynest.room.repository)
+java
+
+package com.staynest.room.repository;
+
+import com.staynest.room.entity.HospitalityReport;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface HospitalityReportRepository extends JpaRepository<HospitalityReport, Integer> {
+    List<HospitalityReport> findByScope(String scope);
+}
+
+Services
+RoomTypeService.java (com.staynest.room.service)
+java
+
+package com.staynest.room.service;
+
+import com.staynest.room.dto.RoomTypeRequest;
+import com.staynest.room.dto.RoomTypeResponse;
+import com.staynest.room.entity.RoomType;
+import com.staynest.room.enums.RatePlanStatus;
+import com.staynest.room.exception.ResourceNotFoundException;
+import com.staynest.room.repository.RoomTypeRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class RoomTypeService {
+
+    private final RoomTypeRepository roomTypeRepository;
+
+    public RoomTypeResponse createRoomType(RoomTypeRequest request) {
+        RoomType roomType = RoomType.builder()
+                .name(request.getName())
+                .bedConfiguration(request.getBedConfiguration())
+                .maxOccupancy(request.getMaxOccupancy())
+                .baseRate(request.getBaseRate())
+                .amenitiesList(request.getAmenitiesList())
+                .build();
+        RoomType saved = roomTypeRepository.save(roomType);
+        log.info("RoomType created: {}", saved.getRoomTypeId());
+        return mapToResponse(saved);
+    }
+
+    public List<RoomTypeResponse> getAllRoomTypes() {
+        return roomTypeRepository.findAll().stream().map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    public RoomTypeResponse getRoomTypeById(Integer id) {
+        RoomType roomType = roomTypeRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("RoomType not found: " + id));
+        return mapToResponse(roomType);
+    }
+
+    public RoomTypeResponse updateStatus(Integer id, RatePlanStatus status) {
+        RoomType roomType = roomTypeRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("RoomType not found: " + id));
+        roomType.setStatus(status);
+        RoomType updated = roomTypeRepository.save(roomType);
+        log.info("RoomType {} status updated to {}", id, status);
+        return mapToResponse(updated);
+    }
+
+    private RoomTypeResponse mapToResponse(RoomType rt) {
+        return RoomTypeResponse.builder()
+                .roomTypeId(rt.getRoomTypeId())
+                .name(rt.getName())
+                .bedConfiguration(rt.getBedConfiguration())
+                .maxOccupancy(rt.getMaxOccupancy())
+                .baseRate(rt.getBaseRate())
+                .amenitiesList(rt.getAmenitiesList())
+                .status(rt.getStatus())
+                .build();
+    }
+}
+
+RoomService.java (com.staynest.room.service)
+java
+
+package com.staynest.room.service;
+
+import com.staynest.room.dto.RoomRequest;
+import com.staynest.room.dto.RoomResponse;
+import com.staynest.room.entity.Room;
+import com.staynest.room.entity.RoomType;
+import com.staynest.room.enums.RoomStatus;
+import com.staynest.room.exception.BadRequestException;
+import com.staynest.room.exception.ResourceNotFoundException;
+import com.staynest.room.repository.RoomRepository;
+import com.staynest.room.repository.RoomTypeRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class RoomService {
+
+    private final RoomRepository roomRepository;
+    private final RoomTypeRepository roomTypeRepository;
+
+    public RoomResponse addRoom(RoomRequest request) {
+        RoomType roomType = roomTypeRepository.findById(request.getRoomTypeId())
+                .orElseThrow(() -> new BadRequestException("Invalid RoomTypeId: " + request.getRoomTypeId()));
+
+        Room room = Room.builder()
+                .roomNumber(request.getRoomNumber())
+                .floor(request.getFloor())
+                .roomType(roomType)
+                .build();
+        Room saved = roomRepository.save(room);
+        log.info("Room created: {}", saved.getRoomId());
+        return mapToResponse(saved);
+    }
+
+    public List<RoomResponse> getAllRooms() {
+        return roomRepository.findAll().stream().map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    public RoomResponse getRoomById(Integer id) {
+        Room room = roomRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Room not found: " + id));
+        return mapToResponse(room);
+    }
+
+    public List<RoomResponse> getRoomsByStatus(RoomStatus status) {
+        return roomRepository.findByStatus(status).stream().map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    public List<RoomResponse> getRoomsByType(Integer roomTypeId) {
+        return roomRepository.findByRoomType_RoomTypeId(roomTypeId).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    public RoomResponse updateRoomStatus(Integer id, RoomStatus status) {
+        Room room = roomRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Room not found: " + id));
+        room.setStatus(status);
+        Room updated = roomRepository.save(room);
+        log.info("Room {} status updated to {}", id, status);
+        return mapToResponse(updated);
+    }
+
+    private RoomResponse mapToResponse(Room room) {
+        return RoomResponse.builder()
+                .roomId(room.getRoomId())
+                .roomNumber(room.getRoomNumber())
+                .floor(room.getFloor())
+                .roomTypeId(room.getRoomType().getRoomTypeId())
+                .roomTypeName(room.getRoomType().getName().name())
+                .status(room.getStatus())
+                .build();
+    }
+}
+
+RatePlanService.java (com.staynest.room.service)
+java
+
+package com.staynest.room.service;
+
+import com.staynest.room.dto.RatePlanRequest;
+import com.staynest.room.dto.RatePlanResponse;
+import com.staynest.room.entity.RatePlan;
+import com.staynest.room.entity.RoomType;
+import com.staynest.room.enums.RatePlanStatus;
+import com.staynest.room.exception.BadRequestException;
+import com.staynest.room.exception.ResourceNotFoundException;
+import com.staynest.room.repository.RatePlanRepository;
+import com.staynest.room.repository.RoomTypeRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDate;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class RatePlanService {
+
+    private final RatePlanRepository ratePlanRepository;
+    private final RoomTypeRepository roomTypeRepository;
+
+    public RatePlanResponse createRatePlan(RatePlanRequest request) {
+        RoomType roomType = roomTypeRepository.findById(request.getRoomTypeId())
+                .orElseThrow(() -> new BadRequestException("Invalid RoomTypeId: " + request.getRoomTypeId()));
+
+        RatePlan ratePlan = RatePlan.builder()
+                .roomType(roomType)
+                .name(request.getName())
+                .pricePerNight(request.getPricePerNight())
+                .validFrom(request.getValidFrom())
+                .validTo(request.getValidTo())
+                .mealPlanIncluded(request.getMealPlanIncluded())
+                .build();
+        RatePlan saved = ratePlanRepository.save(ratePlan);
+        log.info("RatePlan created: {}", saved.getRatePlanId());
+        return mapToResponse(saved);
+    }
+
+    public List<RatePlanResponse> getAllRatePlans() {
+        return ratePlanRepository.findAll().stream().map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    public List<RatePlanResponse> getActivePlansForRoomType(Integer roomTypeId, LocalDate date) {
+        List<RatePlan> plans = ratePlanRepository
+                .findByRoomType_RoomTypeIdAndStatusAndValidFromLessThanEqualAndValidToGreaterThanEqual(
+                        roomTypeId, RatePlanStatus.ACTIVE, date, date);
+        return plans.stream().map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    public RatePlanResponse updateStatus(Integer id, RatePlanStatus status) {
+        RatePlan ratePlan = ratePlanRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("RatePlan not found: " + id));
+        ratePlan.setStatus(status);
+        RatePlan updated = ratePlanRepository.save(ratePlan);
+        log.info("RatePlan {} status updated to {}", id, status);
+        return mapToResponse(updated);
+    }
+
+    private RatePlanResponse mapToResponse(RatePlan rp) {
+        return RatePlanResponse.builder()
+                .ratePlanId(rp.getRatePlanId())
+                .roomTypeId(rp.getRoomType().getRoomTypeId())
+                .roomTypeName(rp.getRoomType().getName().name())
+                .name(rp.getName())
+                .pricePerNight(rp.getPricePerNight())
+                .validFrom(rp.getValidFrom())
+                .validTo(rp.getValidTo())
+                .mealPlanIncluded(rp.getMealPlanIncluded())
+                .status(rp.getStatus())
+                .build();
+    }
+}
+
+HospitalityReportService.java (com.staynest.room.service)
+java
+
+package com.staynest.room.service;
+
+import com.staynest.room.entity.HospitalityReport;
+import com.staynest.room.exception.ResourceNotFoundException;
+import com.staynest.room.repository.HospitalityReportRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class HospitalityReportService {
+
+    private final HospitalityReportRepository reportRepository;
+
+    public HospitalityReport generateReport(String scope, String metrics) {
+        HospitalityReport report = HospitalityReport.builder()
+                .scope(scope)
+                .metrics(metrics)
+                .build();
+        HospitalityReport saved = reportRepository.save(report);
+        log.info("Report generated: {}", saved.getReportId());
+        return saved;
+    }
+
+    public List<HospitalityReport> getAllReports() {
+        return reportRepository.findAll();
+    }
+
+    public List<HospitalityReport> getReportsByScope(String scope) {
+        return reportRepository.findByScope(scope);
+    }
+
+    public HospitalityReport getReportById(Integer id) {
+        return reportRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Report not found: " + id));
+    }
+}
+
+Controllers
+RoomTypeController.java (com.staynest.room.controller)
+java
+
+package com.staynest.room.controller;
+
+import com.staynest.room.dto.ApiResponse;
+import com.staynest.room.dto.RoomTypeRequest;
+import com.staynest.room.dto.RoomTypeResponse;
+import com.staynest.room.enums.RatePlanStatus;
+import com.staynest.room.service.RoomTypeService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/room-types")
+@RequiredArgsConstructor
+public class RoomTypeController {
+
+    private final RoomTypeService roomTypeService;
+
+    @PostMapping
+    public ResponseEntity<ApiResponse<RoomTypeResponse>> create(@Valid @RequestBody RoomTypeRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success("RoomType created", roomTypeService.createRoomType(request)));
+    }
+
+    @GetMapping
+    public ResponseEntity<ApiResponse<List<RoomTypeResponse>>> getAll() {
+        return ResponseEntity.ok(ApiResponse.success(roomTypeService.getAllRoomTypes()));
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<ApiResponse<RoomTypeResponse>> getById(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success(roomTypeService.getRoomTypeById(id)));
+    }
+
+    @PatchMapping("/{id}/status")
+    public ResponseEntity<ApiResponse<RoomTypeResponse>> updateStatus(
+            @PathVariable Integer id,
+            @RequestParam RatePlanStatus status) {
+        return ResponseEntity.ok(ApiResponse.success(roomTypeService.updateStatus(id, status)));
+    }
+}
+
+RoomController.java (com.staynest.room.controller)
+java
+
+package com.staynest.room.controller;
+
+import com.staynest.room.dto.ApiResponse;
+import com.staynest.room.dto.RoomRequest;
+import com.staynest.room.dto.RoomResponse;
+import com.staynest.room.enums.RoomStatus;
+import com.staynest.room.service.RoomService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/rooms")
+@RequiredArgsConstructor
+public class RoomController {
+
+    private final RoomService roomService;
+
+    @PostMapping
+    public ResponseEntity<ApiResponse<RoomResponse>> create(@Valid @RequestBody RoomRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success("Room created", roomService.addRoom(request)));
+    }
+
+    @GetMapping
+    public ResponseEntity<ApiResponse<List<RoomResponse>>> getAll(
+            @RequestParam(required = false) RoomStatus status,
+            @RequestParam(required = false) Integer roomTypeId) {
+        if (status != null) {
+            return ResponseEntity.ok(ApiResponse.success(roomService.getRoomsByStatus(status)));
+        }
+        if (roomTypeId != null) {
+            return ResponseEntity.ok(ApiResponse.success(roomService.getRoomsByType(roomTypeId)));
+        }
+        return ResponseEntity.ok(ApiResponse.success(roomService.getAllRooms()));
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<ApiResponse<RoomResponse>> getById(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success(roomService.getRoomById(id)));
+    }
+
+    @PatchMapping("/{id}/status")
+    public ResponseEntity<ApiResponse<RoomResponse>> updateStatus(
+            @PathVariable Integer id,
+            @RequestParam RoomStatus status) {
+        return ResponseEntity.ok(ApiResponse.success(roomService.updateRoomStatus(id, status)));
+    }
+
+    @GetMapping("/available")
+    public ResponseEntity<ApiResponse<List<RoomResponse>>> getAvailable(
+            @RequestParam String checkIn,
+            @RequestParam String checkOut) {
+        // Phase 1: Return all AVAILABLE rooms (simplified)
+        return ResponseEntity.ok(ApiResponse.success(roomService.getRoomsByStatus(RoomStatus.AVAILABLE)));
+    }
+}
+
+RatePlanController.java (com.staynest.room.controller)
+java
+
+package com.staynest.room.controller;
+
+import com.staynest.room.dto.ApiResponse;
+import com.staynest.room.dto.RatePlanRequest;
+import com.staynest.room.dto.RatePlanResponse;
+import com.staynest.room.enums.RatePlanStatus;
+import com.staynest.room.service.RatePlanService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.LocalDate;
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/rate-plans")
+@RequiredArgsConstructor
+public class RatePlanController {
+
+    private final RatePlanService ratePlanService;
+
+    @PostMapping
+    public ResponseEntity<ApiResponse<RatePlanResponse>> create(@Valid @RequestBody RatePlanRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success("RatePlan created", ratePlanService.createRatePlan(request)));
+    }
+
+    @GetMapping
+    public ResponseEntity<ApiResponse<List<RatePlanResponse>>> getAll(
+            @RequestParam(required = false) Integer roomTypeId,
+            @RequestParam(required = false) LocalDate date) {
+        if (roomTypeId != null && date != null) {
+            return ResponseEntity.ok(ApiResponse.success(ratePlanService.getActivePlansForRoomType(roomTypeId, date)));
+        }
+        return ResponseEntity.ok(ApiResponse.success(ratePlanService.getAllRatePlans()));
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<ApiResponse<RatePlanResponse>> getById(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success(ratePlanService.getAllRatePlans().stream()
+                .filter(rp -> rp.getRatePlanId().equals(id)).findFirst().orElse(null)));
+    }
+
+    @PatchMapping("/{id}/status")
+    public ResponseEntity<ApiResponse<RatePlanResponse>> updateStatus(
+            @PathVariable Integer id,
+            @RequestParam RatePlanStatus status) {
+        return ResponseEntity.ok(ApiResponse.success(ratePlanService.updateStatus(id, status)));
+    }
+}
+
+HospitalityReportController.java (com.staynest.room.controller)
+java
+
+package com.staynest.room.controller;
+
+import com.staynest.room.dto.ApiResponse;
+import com.staynest.room.entity.HospitalityReport;
+import com.staynest.room.service.HospitalityReportService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/hospitality-reports")
+@RequiredArgsConstructor
+public class HospitalityReportController {
+
+    private final HospitalityReportService reportService;
+
+    @PostMapping
+    public ResponseEntity<ApiResponse<HospitalityReport>> generate(
+            @RequestParam String scope,
+            @RequestParam String metrics) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success("Report generated", reportService.generateReport(scope, metrics)));
+    }
+
+    @GetMapping
+    public ResponseEntity<ApiResponse<List<HospitalityReport>>> getAll() {
+        return ResponseEntity.ok(ApiResponse.success(reportService.getAllReports()));
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<ApiResponse<HospitalityReport>> getById(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success(reportService.getReportById(id)));
+    }
+
+    @GetMapping("/summary")
+    public ResponseEntity<ApiResponse<String>> getSummary() {
+        // Hardcoded summary for Phase 1
+        String summary = "{\"occupancyRate\":78,\"adr\":4500,\"revPAR\":3510,\"guestScore\":4.2}";
+        return ResponseEntity.ok(ApiResponse.success(summary));
+    }
+}
+
+Main Application
+RoomServiceApplication.java (com.staynest.room)
+java
+
+package com.staynest.room;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
+
+@SpringBootApplication
+@EnableDiscoveryClient
+public class RoomServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(RoomServiceApplication.class, args);
+    }
+}
+
+JUnit Tests
+RoomServiceTest.java (com.staynest.room.service)
+java
+
+package com.staynest.room.service;
+
+import com.staynest.room.dto.RoomRequest;
+import com.staynest.room.entity.Room;
+import com.staynest.room.entity.RoomType;
+import com.staynest.room.enums.RoomStatus;
+import com.staynest.room.enums.RoomTypeName;
+import com.staynest.room.exception.BadRequestException;
+import com.staynest.room.repository.RoomRepository;
+import com.staynest.room.repository.RoomTypeRepository;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.math.BigDecimal;
+import java.util.Optional;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class RoomServiceTest {
+
+    @Mock private RoomRepository roomRepository;
+    @Mock private RoomTypeRepository roomTypeRepository;
+    @InjectMocks private RoomService roomService;
+
+    private RoomType roomType;
+    private Room room;
+    private RoomRequest request;
+
+    @BeforeEach
+    void setUp() {
+        roomType = RoomType.builder()
+                .roomTypeId(1).name(RoomTypeName.STANDARD)
+                .baseRate(new BigDecimal("2000")).maxOccupancy(2).build();
+
+        room = Room.builder()
+                .roomId(1).roomNumber("101").floor(1)
+                .roomType(roomType).status(RoomStatus.AVAILABLE).build();
+
+        request = new RoomRequest();
+        request.setRoomNumber("101");
+        request.setFloor(1);
+        request.setRoomTypeId(1);
+    }
+
+    @Test
+    void addRoom_validRoomType_shouldCreate() {
+        when(roomTypeRepository.findById(1)).thenReturn(Optional.of(roomType));
+        when(roomRepository.save(any(Room.class))).thenReturn(room);
+
+        var response = roomService.addRoom(request);
+        assertNotNull(response);
+        assertEquals("101", response.getRoomNumber());
+    }
+
+    @Test
+    void addRoom_invalidRoomType_shouldThrow() {
+        when(roomTypeRepository.findById(99)).thenReturn(Optional.empty());
+        assertThrows(BadRequestException.class, () -> roomService.addRoom(request));
+    }
+
+    @Test
+    void updateRoomStatus_shouldChange() {
+        when(roomRepository.findById(1)).thenReturn(Optional.of(room));
+        when(roomRepository.save(any(Room.class))).thenReturn(room);
+
+        var response = roomService.updateRoomStatus(1, RoomStatus.OCCUPIED);
+        assertEquals(RoomStatus.OCCUPIED, response.getStatus());
+    }
+
+    @Test
+    void getRoomsByStatus_shouldReturnCorrect() {
+        when(roomRepository.findByStatus(RoomStatus.AVAILABLE)).thenReturn(java.util.List.of(room));
+        var rooms = roomService.getRoomsByStatus(RoomStatus.AVAILABLE);
+        assertEquals(1, rooms.size());
+    }
