@@ -1,0 +1,1043 @@
+Phase 1: IAM Service (staynest-iam-service)
+Dependencies in STS: Spring Web, Spring Data JPA, MySQL Driver, Spring Security, Eureka Discovery Client, Lombok, Validation
+Manual pom.xml addition for JWT:
+xml
+
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-api</artifactId>
+    <version>0.11.5</version>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-impl</artifactId>
+    <version>0.11.5</version>
+    <scope>runtime</scope>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-jackson</artifactId>
+    <version>0.11.5</version>
+    <scope>runtime</scope>
+</dependency>
+
+application.yml:
+yaml
+
+server:
+  port: 8081
+
+spring:
+  application:
+    name: iam-service
+  
+  datasource:
+    url: jdbc:mysql://localhost:3306/staynest_iam_db?createDatabaseIfNotExist=true&useSSL=false&serverTimezone=UTC
+    username: root
+    password: root
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQL8Dialect
+        format_sql: true
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+jwt:
+  secret: staynest-secret-key-for-jwt-signing-2026
+  expiration: 86400000
+
+Enums
+Role.java (com.staynest.iam.enums)
+java
+
+package com.staynest.iam.enums;
+
+public enum Role {
+    GUEST,
+    FRONTDESK,
+    HOUSEKEEPING,
+    FBMANAGER,
+    REVENUEMANAGER,
+    ADMIN
+}
+
+UserStatus.java (com.staynest.iam.enums)
+java
+
+package com.staynest.iam.enums;
+
+public enum UserStatus {
+    ACTIVE,
+    INACTIVE
+}
+
+JWT Trio (Self-contained in IAM Service)
+JwtUtil.java (com.staynest.iam.jwt)
+java
+
+package com.staynest.iam.jwt;
+
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.SignatureAlgorithm;
+import io.jsonwebtoken.security.Keys;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import javax.crypto.SecretKey;
+import java.nio.charset.StandardCharsets;
+import java.util.Date;
+
+@Component
+public class JwtUtil {
+
+    @Value("${jwt.secret}")
+    private String secret;
+
+    @Value("${jwt.expiration}")
+    private long expiration;
+
+    private SecretKey getSigningKey() {
+        return Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public String generateToken(String email, String role) {
+        return Jwts.builder()
+                .setSubject(email)
+                .claim("role", role)
+                .setIssuedAt(new Date())
+                .setExpiration(new Date(System.currentTimeMillis() + expiration))
+                .signWith(getSigningKey(), SignatureAlgorithm.HS256)
+                .compact();
+    }
+
+    public boolean validateToken(String token) {
+        try {
+            Jwts.parserBuilder().setSigningKey(getSigningKey()).build().parseClaimsJws(token);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public String extractEmail(String token) {
+        return getClaims(token).getSubject();
+    }
+
+    public String extractRole(String token) {
+        return getClaims(token).get("role", String.class);
+    }
+
+    private Claims getClaims(String token) {
+        return Jwts.parserBuilder().setSigningKey(getSigningKey()).build().parseClaimsJws(token).getBody();
+    }
+}
+
+JwtFilter.java (com.staynest.iam.jwt)
+java
+
+package com.staynest.iam.jwt;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.Collections;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class JwtFilter extends OncePerRequestFilter {
+
+    private final JwtUtil jwtUtil;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
+            throws ServletException, IOException {
+        
+        String header = request.getHeader("Authorization");
+        
+        if (header != null && header.startsWith("Bearer ")) {
+            String token = header.substring(7);
+            if (jwtUtil.validateToken(token)) {
+                String email = jwtUtil.extractEmail(token);
+                String role = jwtUtil.extractRole(token);
+                var auth = new UsernamePasswordAuthenticationToken(
+                    email, null, Collections.singletonList(new SimpleGrantedAuthority("ROLE_" + role)));
+                SecurityContextHolder.getContext().setAuthentication(auth);
+            }
+        }
+        chain.doFilter(request, response);
+    }
+}
+
+SecurityConfig.java (com.staynest.iam.config)
+java
+
+package com.staynest.iam.config;
+
+import com.staynest.iam.jwt.JwtFilter;
+import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+import java.util.Arrays;
+import java.util.List;
+
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+@RequiredArgsConstructor
+public class SecurityConfig {
+
+    private final JwtFilter jwtFilter;
+
+    @Bean
+    public BCryptPasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http.csrf(csrf -> csrf.disable())
+            .cors(cors -> cors.configurationSource(corsConfigurationSource()))
+            .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/auth/**").permitAll()
+                .requestMatchers("/actuator/**").permitAll()
+                .anyRequest().authenticated())
+            .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration config = new CorsConfiguration();
+        config.setAllowedOrigins(List.of("http://localhost:3000"));
+        config.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+        config.setAllowedHeaders(List.of("*"));
+        config.setAllowCredentials(true);
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", config);
+        return source;
+    }
+
+    @Bean
+    public AuthenticationManager authenticationManager(AuthenticationConfiguration config) throws Exception {
+        return config.getAuthenticationManager();
+    }
+}
+
+Exceptions (Self-contained)
+ResourceNotFoundException.java (com.staynest.iam.exception)
+java
+
+package com.staynest.iam.exception;
+
+public class ResourceNotFoundException extends RuntimeException {
+    public ResourceNotFoundException(String message) {
+        super(message);
+    }
+}
+
+BadRequestException.java (com.staynest.iam.exception)
+java
+
+package com.staynest.iam.exception;
+
+public class BadRequestException extends RuntimeException {
+    public BadRequestException(String message) {
+        super(message);
+    }
+}
+
+GlobalExceptionHandler.java (com.staynest.iam.exception)
+java
+
+package com.staynest.iam.exception;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleNotFound(ResourceNotFoundException ex) {
+        return buildError(HttpStatus.NOT_FOUND, ex.getMessage());
+    }
+
+    @ExceptionHandler(BadRequestException.class)
+    public ResponseEntity<Map<String, Object>> handleBadRequest(BadRequestException ex) {
+        return buildError(HttpStatus.BAD_REQUEST, ex.getMessage());
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<Map<String, Object>> handleGeneric(Exception ex) {
+        log.error("Unexpected error: ", ex);
+        return buildError(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred");
+    }
+
+    private ResponseEntity<Map<String, Object>> buildError(HttpStatus status, String message) {
+        Map<String, Object> error = new HashMap<>();
+        error.put("timestamp", LocalDateTime.now());
+        error.put("status", status.value());
+        error.put("error", status.getReasonPhrase());
+        error.put("message", message);
+        return new ResponseEntity<>(error, status);
+    }
+}
+
+DTOs
+ApiResponse.java (com.staynest.iam.dto)
+java
+
+package com.staynest.iam.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class ApiResponse<T> {
+    private boolean success;
+    private String message;
+    private T data;
+    private long timestamp;
+
+    public static <T> ApiResponse<T> success(T data) {
+        return ApiResponse.<T>builder().success(true).data(data).timestamp(System.currentTimeMillis()).build();
+    }
+
+    public static <T> ApiResponse<T> success(String message, T data) {
+        return ApiResponse.<T>builder().success(true).message(message).data(data).timestamp(System.currentTimeMillis()).build();
+    }
+
+    public static <T> ApiResponse<T> error(String message) {
+        return ApiResponse.<T>builder().success(false).message(message).timestamp(System.currentTimeMillis()).build();
+    }
+}
+
+LoginRequest.java (com.staynest.iam.dto)
+java
+
+package com.staynest.iam.dto;
+
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import lombok.Data;
+
+@Data
+public class LoginRequest {
+    @NotBlank @Email
+    private String email;
+    @NotBlank
+    private String password;
+}
+
+LoginResponse.java (com.staynest.iam.dto)
+java
+
+package com.staynest.iam.dto;
+
+import com.staynest.iam.enums.Role;
+import lombok.Builder;
+import lombok.Data;
+
+@Data
+@Builder
+public class LoginResponse {
+    private String token;
+    private Role role;
+    private Integer userId;
+    private String email;
+    private String name;
+}
+
+UserRequest.java (com.staynest.iam.dto)
+java
+
+package com.staynest.iam.dto;
+
+import com.staynest.iam.enums.Role;
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+
+@Data
+public class UserRequest {
+    @NotBlank
+    private String name;
+    @NotNull
+    private Role role;
+    @NotBlank @Email
+    private String email;
+    private String phone;
+    @NotBlank
+    private String password;
+}
+
+UserResponse.java (com.staynest.iam.dto)
+java
+
+package com.staynest.iam.dto;
+
+import com.staynest.iam.enums.Role;
+import com.staynest.iam.enums.UserStatus;
+import lombok.Builder;
+import lombok.Data;
+
+import java.time.LocalDateTime;
+
+@Data
+@Builder
+public class UserResponse {
+    private Integer userId;
+    private String name;
+    private Role role;
+    private String email;
+    private String phone;
+    private UserStatus status;
+    private LocalDateTime createdAt;
+}
+
+Entities
+User.java (com.staynest.iam.entity)
+java
+
+package com.staynest.iam.entity;
+
+import com.staynest.iam.enums.Role;
+import com.staynest.iam.enums.UserStatus;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "users")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class User {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "UserID")
+    private Integer userId;
+
+    @Column(name = "Name", nullable = false, length = 100)
+    private String name;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Role", nullable = false)
+    private Role role;
+
+    @Column(name = "Email", nullable = false, unique = true, length = 150)
+    private String email;
+
+    @Column(name = "Phone", length = 20)
+    private String phone;
+
+    @Column(name = "Password", nullable = false)
+    private String password;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Status", nullable = false)
+    @Builder.Default
+    private UserStatus status = UserStatus.ACTIVE;
+
+    @CreationTimestamp
+    @Column(name = "CreatedAt", updatable = false)
+    private LocalDateTime createdAt;
+
+    @UpdateTimestamp
+    @Column(name = "UpdatedAt")
+    private LocalDateTime updatedAt;
+}
+
+AuditLog.java (com.staynest.iam.entity)
+java
+
+package com.staynest.iam.entity;
+
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "audit_logs")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class AuditLog {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "AuditID")
+    private Integer auditId;
+
+    @Column(name = "UserID")
+    private Integer userId;
+
+    @Column(name = "Action", nullable = false, length = 50)
+    private String action;
+
+    @Column(name = "EntityType", nullable = false, length = 50)
+    private String entityType;
+
+    @Column(name = "EntityId")
+    private Integer entityId;
+
+    @CreationTimestamp
+    @Column(name = "Timestamp", updatable = false)
+    private LocalDateTime timestamp;
+}
+
+Repositories
+UserRepository.java (com.staynest.iam.repository)
+java
+
+package com.staynest.iam.repository;
+
+import com.staynest.iam.entity.User;
+import com.staynest.iam.enums.UserStatus;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+import java.util.Optional;
+
+@Repository
+public interface UserRepository extends JpaRepository<User, Integer> {
+    Optional<User> findByEmail(String email);
+    List<User> findByStatus(UserStatus status);
+    boolean existsByEmail(String email);
+}
+
+AuditLogRepository.java (com.staynest.iam.repository)
+java
+
+package com.staynest.iam.repository;
+
+import com.staynest.iam.entity.AuditLog;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.time.LocalDateTime;
+import java.util.List;
+
+@Repository
+public interface AuditLogRepository extends JpaRepository<AuditLog, Integer> {
+    List<AuditLog> findByUserId(Integer userId);
+    List<AuditLog> findByAction(String action);
+    List<AuditLog> findByTimestampBetween(LocalDateTime start, LocalDateTime end);
+    Page<AuditLog> findAll(Pageable pageable);
+}
+
+Services
+AuditLogService.java (com.staynest.iam.service)
+java
+
+package com.staynest.iam.service;
+
+import com.staynest.iam.entity.AuditLog;
+import com.staynest.iam.repository.AuditLogRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDateTime;
+import java.util.List;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class AuditLogService {
+
+    private final AuditLogRepository auditLogRepository;
+
+    public void logAction(Integer userId, String action, String entityType, Integer entityId) {
+        AuditLog auditLog = AuditLog.builder()
+                .userId(userId)
+                .action(action)
+                .entityType(entityType)
+                .entityId(entityId)
+                .build();
+        auditLogRepository.save(auditLog);
+        log.info("Audit logged: user={}, action={}, entity={}", userId, action, entityType);
+    }
+
+    public List<AuditLog> getByUserId(Integer userId) {
+        return auditLogRepository.findByUserId(userId);
+    }
+
+    public List<AuditLog> getByAction(String action) {
+        return auditLogRepository.findByAction(action);
+    }
+
+    public List<AuditLog> getByTimestampRange(LocalDateTime start, LocalDateTime end) {
+        return auditLogRepository.findByTimestampBetween(start, end);
+    }
+
+    public Page<AuditLog> getAll(Pageable pageable) {
+        return auditLogRepository.findAll(pageable);
+    }
+}
+
+UserService.java (com.staynest.iam.service)
+java
+
+package com.staynest.iam.service;
+
+import com.staynest.iam.dto.UserRequest;
+import com.staynest.iam.dto.UserResponse;
+import com.staynest.iam.entity.User;
+import com.staynest.iam.enums.Role;
+import com.staynest.iam.enums.UserStatus;
+import com.staynest.iam.exception.BadRequestException;
+import com.staynest.iam.exception.ResourceNotFoundException;
+import com.staynest.iam.repository.UserRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class UserService {
+
+    private final UserRepository userRepository;
+    private final BCryptPasswordEncoder passwordEncoder;
+    private final AuditLogService auditLogService;
+
+    public UserResponse createUser(UserRequest request) {
+        if (userRepository.existsByEmail(request.getEmail())) {
+            throw new BadRequestException("Email already exists: " + request.getEmail());
+        }
+
+        User user = User.builder()
+                .name(request.getName())
+                .role(request.getRole())
+                .email(request.getEmail())
+                .phone(request.getPhone())
+                .password(passwordEncoder.encode(request.getPassword()))
+                .status(UserStatus.ACTIVE)
+                .build();
+
+        User saved = userRepository.save(user);
+        auditLogService.logAction(saved.getUserId(), "CREATE_USER", "User", saved.getUserId());
+        log.info("User created: {}", saved.getEmail());
+        return mapToResponse(saved);
+    }
+
+    public UserResponse getUserById(Integer id) {
+        User user = userRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("User not found with id: " + id));
+        return mapToResponse(user);
+    }
+
+    public UserResponse getUserByEmail(String email) {
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new ResourceNotFoundException("User not found with email: " + email));
+        return mapToResponse(user);
+    }
+
+    public List<UserResponse> getAllUsers() {
+        return userRepository.findAll().stream().map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    public List<UserResponse> getUsersByStatus(UserStatus status) {
+        return userRepository.findByStatus(status).stream().map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    public UserResponse updateUserStatus(Integer id, UserStatus status) {
+        User user = userRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("User not found with id: " + id));
+        user.setStatus(status);
+        User updated = userRepository.save(user);
+        auditLogService.logAction(updated.getUserId(), "UPDATE_STATUS", "User", updated.getUserId());
+        log.info("User {} status updated to {}", id, status);
+        return mapToResponse(updated);
+    }
+
+    public void deleteUser(Integer id) {
+        User user = userRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("User not found with id: " + id));
+        user.setStatus(UserStatus.INACTIVE);
+        userRepository.save(user);
+        auditLogService.logAction(id, "SOFT_DELETE", "User", id);
+        log.info("User {} soft deleted", id);
+    }
+
+    private UserResponse mapToResponse(User user) {
+        return UserResponse.builder()
+                .userId(user.getUserId())
+                .name(user.getName())
+                .role(user.getRole())
+                .email(user.getEmail())
+                .phone(user.getPhone())
+                .status(user.getStatus())
+                .createdAt(user.getCreatedAt())
+                .build();
+    }
+}
+
+Controllers
+AuthController.java (com.staynest.iam.controller)
+java
+
+package com.staynest.iam.controller;
+
+import com.staynest.iam.dto.ApiResponse;
+import com.staynest.iam.dto.LoginRequest;
+import com.staynest.iam.dto.LoginResponse;
+import com.staynest.iam.entity.User;
+import com.staynest.iam.jwt.JwtUtil;
+import com.staynest.iam.repository.UserRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.web.bind.annotation.*;
+
+@Slf4j
+@RestController
+@RequestMapping("/api/auth")
+@RequiredArgsConstructor
+public class AuthController {
+
+    private final UserRepository userRepository;
+    private final BCryptPasswordEncoder passwordEncoder;
+    private final JwtUtil jwtUtil;
+
+    @PostMapping("/login")
+    public ResponseEntity<ApiResponse<LoginResponse>> login(@RequestBody LoginRequest request) {
+        log.info("Login attempt for: {}", request.getEmail());
+        
+        User user = userRepository.findByEmail(request.getEmail()).orElse(null);
+
+        if (user == null || !passwordEncoder.matches(request.getPassword(), user.getPassword())) {
+            log.warn("Invalid credentials for: {}", request.getEmail());
+            return ResponseEntity.status(401).body(ApiResponse.error("Invalid email or password"));
+        }
+
+        String token = jwtUtil.generateToken(user.getEmail(), user.getRole().name());
+        
+        LoginResponse response = LoginResponse.builder()
+                .token(token)
+                .role(user.getRole())
+                .userId(user.getUserId())
+                .email(user.getEmail())
+                .name(user.getName())
+                .build();
+
+        log.info("Login successful for: {}", request.getEmail());
+        return ResponseEntity.ok(ApiResponse.success("Login successful", response));
+    }
+}
+
+UserController.java (com.staynest.iam.controller)
+java
+
+package com.staynest.iam.controller;
+
+import com.staynest.iam.dto.ApiResponse;
+import com.staynest.iam.dto.UserRequest;
+import com.staynest.iam.dto.UserResponse;
+import com.staynest.iam.enums.UserStatus;
+import com.staynest.iam.service.UserService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@Slf4j
+@RestController
+@RequestMapping("/api/users")
+@RequiredArgsConstructor
+public class UserController {
+
+    private final UserService userService;
+
+    @PostMapping
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<ApiResponse<UserResponse>> createUser(@Valid @RequestBody UserRequest request) {
+        log.info("Creating user: {}", request.getEmail());
+        UserResponse created = userService.createUser(request);
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success("User created successfully", created));
+    }
+
+    @GetMapping
+    @PreAuthorize("hasAnyRole('ADMIN', 'REVENUEMANAGER')")
+    public ResponseEntity<ApiResponse<List<UserResponse>>> getAllUsers() {
+        return ResponseEntity.ok(ApiResponse.success(userService.getAllUsers()));
+    }
+
+    @GetMapping("/{id}")
+    @PreAuthorize("hasAnyRole('ADMIN', 'FRONTDESK')")
+    public ResponseEntity<ApiResponse<UserResponse>> getUserById(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success(userService.getUserById(id)));
+    }
+
+    @GetMapping("/email/{email}")
+    public ResponseEntity<ApiResponse<UserResponse>> getUserByEmail(@PathVariable String email) {
+        return ResponseEntity.ok(ApiResponse.success(userService.getUserByEmail(email)));
+    }
+
+    @PatchMapping("/{id}/status")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<ApiResponse<UserResponse>> updateStatus(
+            @PathVariable Integer id,
+            @RequestParam UserStatus status) {
+        log.info("Updating user {} status to {}", id, status);
+        return ResponseEntity.ok(ApiResponse.success(userService.updateUserStatus(id, status)));
+    }
+
+    @DeleteMapping("/{id}")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<ApiResponse<Void>> deleteUser(@PathVariable Integer id) {
+        log.info("Deleting user: {}", id);
+        userService.deleteUser(id);
+        return ResponseEntity.noContent().build();
+    }
+}
+
+AuditLogController.java (com.staynest.iam.controller)
+java
+
+package com.staynest.iam.controller;
+
+import com.staynest.iam.dto.ApiResponse;
+import com.staynest.iam.entity.AuditLog;
+import com.staynest.iam.service.AuditLogService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.LocalDateTime;
+import java.util.List;
+
+@Slf4j
+@RestController
+@RequestMapping("/api/audit-logs")
+@RequiredArgsConstructor
+public class AuditLogController {
+
+    private final AuditLogService auditLogService;
+
+    @GetMapping
+    @PreAuthorize("hasAnyRole('ADMIN', 'REVENUEMANAGER')")
+    public ResponseEntity<ApiResponse<Page<AuditLog>>> getAll(Pageable pageable) {
+        return ResponseEntity.ok(ApiResponse.success(auditLogService.getAll(pageable)));
+    }
+
+    @GetMapping("/user/{userId}")
+    public ResponseEntity<ApiResponse<List<AuditLog>>> getByUserId(@PathVariable Integer userId) {
+        return ResponseEntity.ok(ApiResponse.success(auditLogService.getByUserId(userId)));
+    }
+
+    @GetMapping("/action/{action}")
+    public ResponseEntity<ApiResponse<List<AuditLog>>> getByAction(@PathVariable String action) {
+        return ResponseEntity.ok(ApiResponse.success(auditLogService.getByAction(action)));
+    }
+
+    @GetMapping("/range")
+    public ResponseEntity<ApiResponse<List<AuditLog>>> getByTimestampRange(
+            @RequestParam LocalDateTime start,
+            @RequestParam LocalDateTime end) {
+        return ResponseEntity.ok(ApiResponse.success(auditLogService.getByTimestampRange(start, end)));
+    }
+
+    @PostMapping
+    public ResponseEntity<ApiResponse<Void>> logAction(
+            @RequestParam Integer userId,
+            @RequestParam String action,
+            @RequestParam String entityType,
+            @RequestParam(required = false) Integer entityId) {
+        auditLogService.logAction(userId, action, entityType, entityId);
+        return ResponseEntity.ok(ApiResponse.success("Action logged", null));
+    }
+}
+
+Main Application
+IamServiceApplication.java (com.staynest.iam)
+java
+
+package com.staynest.iam;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
+
+@SpringBootApplication
+@EnableDiscoveryClient
+public class IamServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(IamServiceApplication.class, args);
+    }
+}
+
+JUnit Tests
+UserServiceTest.java (com.staynest.iam.service)
+java
+
+package com.staynest.iam.service;
+
+import com.staynest.iam.dto.UserRequest;
+import com.staynest.iam.dto.UserResponse;
+import com.staynest.iam.entity.User;
+import com.staynest.iam.enums.Role;
+import com.staynest.iam.enums.UserStatus;
+import com.staynest.iam.exception.BadRequestException;
+import com.staynest.iam.exception.ResourceNotFoundException;
+import com.staynest.iam.repository.UserRepository;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+
+import java.util.Optional;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class UserServiceTest {
+
+    @Mock private UserRepository userRepository;
+    @Mock private BCryptPasswordEncoder passwordEncoder;
+    @Mock private AuditLogService auditLogService;
+    @InjectMocks private UserService userService;
+
+    private UserRequest request;
+    private User user;
+
+    @BeforeEach
+    void setUp() {
+        request = new UserRequest();
+        request.setName("Test");
+        request.setEmail("test@test.com");
+        request.setPassword("pass");
+        request.setRole(Role.ADMIN);
+
+        user = User.builder()
+                .userId(1).name("Test").email("test@test.com")
+                .password("hash").role(Role.ADMIN).status(UserStatus.ACTIVE).build();
+    }
+
+    @Test
+    void createUser_valid_shouldCreate() {
+        when(userRepository.existsByEmail(anyString())).thenReturn(false);
+        when(passwordEncoder.encode(anyString())).thenReturn("hash");
+        when(userRepository.save(any(User.class))).thenReturn(user);
+
+        UserResponse response = userService.createUser(request);
+        assertNotNull(response);
+        assertEquals("Test", response.getName());
+    }
+
+    @Test
+    void createUser_duplicateEmail_shouldThrow() {
+        when(userRepository.existsByEmail(anyString())).thenReturn(true);
+        assertThrows(BadRequestException.class, () -> userService.createUser(request));
+    }
+
+    @Test
+    void getUserById_valid_shouldReturn() {
+        when(userRepository.findById(1)).thenReturn(Optional.of(user));
+        UserResponse response = userService.getUserById(1);
+        assertEquals(1, response.getUserId());
+    }
+
+    @Test
+    void getUserById_invalid_shouldThrow() {
+        when(userRepository.findById(999)).thenReturn(Optional.empty());
+        assertThrows(ResourceNotFoundException.class, () -> userService.getUserById(999));
+    }
+
+    @Test
+    void updateStatus_shouldUpdate() {
+        when(userRepository.findById(1)).thenReturn(Optional.of(user));
+        when(userRepository.save(any(User.class))).thenReturn(user);
+        UserResponse response = userService.updateUserStatus(1, UserStatus.INACTIVE);
+        assertEquals(UserStatus.INACTIVE, response.getStatus());
+    }
+}
