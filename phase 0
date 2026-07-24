@@ -1,0 +1,126 @@
+Project Structure (10 Projects)
+plain
+
+staynest/
+├── staynest-eureka-server/        # Port 8761
+├── staynest-api-gateway/          # Port 8080
+├── staynest-iam-service/          # Port 8081 - Identity & Access
+├── staynest-room-service/         # Port 8082 - Room Inventory & Config
+├── staynest-reservation-service/  # Port 8083 - Reservation & Booking
+├── staynest-frontdesk-service/    # Port 8084 - Front Desk & Stay
+├── staynest-housekeeping-service/ # Port 8085 - Housekeeping
+├── staynest-fb-service/           # Port 8086 - F&B & Ancillary
+├── staynest-revenue-service/      # Port 8087 - Revenue & Analytics
+└── staynest-notification-service/ # Port 8088 - Notifications
+
+Phase 0: Infrastructure
+1. Eureka Server (staynest-eureka-server)
+Dependencies in STS: Eureka Server
+application.yml:
+yaml
+
+server:
+  port: 8761
+
+eureka:
+  client:
+    register-with-eureka: false
+    fetch-registry: false
+  server:
+    enable-self-preservation: false
+
+EurekaServerApplication.java:
+java
+
+package com.staynest.eureka;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cloud.netflix.eureka.server.EnableEurekaServer;
+
+@SpringBootApplication
+@EnableEurekaServer
+public class EurekaServerApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(EurekaServerApplication.class, args);
+    }
+}
+
+2. API Gateway (staynest-api-gateway)
+Dependencies in STS: Gateway, Eureka Discovery Client
+application.yml:
+yaml
+
+server:
+  port: 8080
+
+spring:
+  application:
+    name: api-gateway
+  cloud:
+    gateway:
+      routes:
+        - id: iam-service
+          uri: lb://iam-service
+          predicates:
+            - Path=/api/auth/**, /api/users/**, /api/audit-logs/**
+        
+        - id: room-service
+          uri: lb://room-service
+          predicates:
+            - Path=/api/room-types/**, /api/rooms/**, /api/rate-plans/**, /api/hospitality-reports/**
+        
+        - id: reservation-service
+          uri: lb://reservation-service
+          predicates:
+            - Path=/api/guests/**, /api/reservations/**
+        
+        - id: frontdesk-service
+          uri: lb://frontdesk-service
+          predicates:
+            - Path=/api/stay-records/**, /api/folio-items/**
+        
+        - id: housekeeping-service
+          uri: lb://housekeeping-service
+          predicates:
+            - Path=/api/housekeeping-tasks/**, /api/maintenance-requests/**
+        
+        - id: fb-service
+          uri: lb://fb-service
+          predicates:
+            - Path=/api/menu-items/**, /api/fb-orders/**, /api/dining-reservations/**
+        
+        - id: revenue-service
+          uri: lb://revenue-service
+          predicates:
+            - Path=/api/reports/**
+        
+        - id: notification-service
+          uri: lb://notification-service
+          predicates:
+            - Path=/api/notifications/**
+
+      default-filters:
+        - DedupeResponseHeader=Access-Control-Allow-Credentials Access-Control-Allow-Origin
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+
+ApiGatewayApplication.java:
+java
+
+package com.staynest.gateway;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
+
+@SpringBootApplication
+@EnableDiscoveryClient
+public class ApiGatewayApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ApiGatewayApplication.class, args);
+    }
+}
