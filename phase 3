@@ -1,0 +1,1345 @@
+Here's **Phase 3: Reservation Service** — complete, self-contained, no common library.
+
+---
+
+## Phase 3: Reservation Service (`staynest-reservation-service`)
+
+**Dependencies in STS:** `Spring Web`, `Spring Data JPA`, `MySQL Driver`, `Spring Security`, `Eureka Discovery Client`, `OpenFeign`, `Lombok`, `Validation`
+
+**Manual `pom.xml` addition for JWT:**
+```xml
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-api</artifactId>
+    <version>0.11.5</version>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-impl</artifactId>
+    <version>0.11.5</version>
+    <scope>runtime</scope>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-jackson</artifactId>
+    <version>0.11.5</version>
+    <scope>runtime</scope>
+</dependency>
+```
+
+**`application.yml`:**
+```yaml
+server:
+  port: 8083
+
+spring:
+  application:
+    name: reservation-service
+  datasource:
+    url: jdbc:mysql://localhost:3306/staynest_reservation_db?createDatabaseIfNotExist=true&useSSL=false&serverTimezone=UTC
+    username: root
+    password: root
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQL8Dialect
+        format_sql: true
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+jwt:
+  secret: staynest-secret-key-for-jwt-signing-2026
+  expiration: 86400000
+```
+
+---
+
+### Main Application
+
+**`ReservationServiceApplication.java`** (`com.staynest.reservation`)
+```java
+package com.staynest.reservation;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
+import org.springframework.cloud.openfeign.EnableFeignClients;
+
+@SpringBootApplication
+@EnableDiscoveryClient
+@EnableFeignClients
+public class ReservationServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ReservationServiceApplication.class, args);
+    }
+}
+```
+
+---
+
+### Enums
+
+**`LoyaltyTier.java`** (`com.staynest.reservation.enums`)
+```java
+package com.staynest.reservation.enums;
+
+public enum LoyaltyTier {
+    NONE,
+    SILVER,
+    GOLD,
+    PLATINUM
+}
+```
+
+**`GuestStatus.java`** (`com.staynest.reservation.enums`)
+```java
+package com.staynest.reservation.enums;
+
+public enum GuestStatus {
+    ACTIVE,
+    BLACKLISTED
+}
+```
+
+**`BookingChannel.java`** (`com.staynest.reservation.enums`)
+```java
+package com.staynest.reservation.enums;
+
+public enum BookingChannel {
+    DIRECT,
+    PHONE,
+    WALKIN
+}
+```
+
+**`ReservationStatus.java`** (`com.staynest.reservation.enums`)
+```java
+package com.staynest.reservation.enums;
+
+public enum ReservationStatus {
+    CONFIRMED,
+    CHECKEDIN,
+    CHECKEDOUT,
+    CANCELLED,
+    NOSHOW
+}
+```
+
+---
+
+### JWT Trio (Self-contained)
+
+**`JwtUtil.java`** (`com.staynest.reservation.jwt`)
+```java
+package com.staynest.reservation.jwt;
+
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.SignatureAlgorithm;
+import io.jsonwebtoken.security.Keys;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import javax.crypto.SecretKey;
+import java.nio.charset.StandardCharsets;
+import java.util.Date;
+
+@Component
+public class JwtUtil {
+
+    @Value("${jwt.secret}")
+    private String secret;
+
+    @Value("${jwt.expiration}")
+    private long expiration;
+
+    private SecretKey getSigningKey() {
+        return Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public boolean validateToken(String token) {
+        try {
+            Jwts.parserBuilder().setSigningKey(getSigningKey()).build().parseClaimsJws(token);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public String extractEmail(String token) {
+        return getClaims(token).getSubject();
+    }
+
+    public String extractRole(String token) {
+        return getClaims(token).get("role", String.class);
+    }
+
+    private Claims getClaims(String token) {
+        return Jwts.parserBuilder().setSigningKey(getSigningKey()).build().parseClaimsJws(token).getBody();
+    }
+}
+```
+
+**`JwtFilter.java`** (`com.staynest.reservation.jwt`)
+```java
+package com.staynest.reservation.jwt;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.Collections;
+
+@Component
+@RequiredArgsConstructor
+public class JwtFilter extends OncePerRequestFilter {
+
+    private final JwtUtil jwtUtil;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
+            throws ServletException, IOException {
+        
+        String header = request.getHeader("Authorization");
+        
+        if (header != null && header.startsWith("Bearer ")) {
+            String token = header.substring(7);
+            if (jwtUtil.validateToken(token)) {
+                String email = jwtUtil.extractEmail(token);
+                String role = jwtUtil.extractRole(token);
+                var auth = new UsernamePasswordAuthenticationToken(
+                    email, null, Collections.singletonList(new SimpleGrantedAuthority("ROLE_" + role)));
+                SecurityContextHolder.getContext().setAuthentication(auth);
+            }
+        }
+        chain.doFilter(request, response);
+    }
+}
+```
+
+**`SecurityConfig.java`** (`com.staynest.reservation.config`)
+```java
+package com.staynest.reservation.config;
+
+import com.staynest.reservation.jwt.JwtFilter;
+import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+import java.util.Arrays;
+import java.util.List;
+
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+@RequiredArgsConstructor
+public class SecurityConfig {
+
+    private final JwtFilter jwtFilter;
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http.csrf(csrf -> csrf.disable())
+            .cors(cors -> cors.configurationSource(corsConfigurationSource()))
+            .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/auth/**", "/actuator/**").permitAll()
+                .anyRequest().authenticated())
+            .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration config = new CorsConfiguration();
+        config.setAllowedOrigins(List.of("http://localhost:3000"));
+        config.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+        config.setAllowedHeaders(List.of("*"));
+        config.setAllowCredentials(true);
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", config);
+        return source;
+    }
+}
+```
+
+---
+
+### Exceptions
+
+**`ResourceNotFoundException.java`** (`com.staynest.reservation.exception`)
+```java
+package com.staynest.reservation.exception;
+
+public class ResourceNotFoundException extends RuntimeException {
+    public ResourceNotFoundException(String message) {
+        super(message);
+    }
+}
+```
+
+**`BadRequestException.java`** (`com.staynest.reservation.exception`)
+```java
+package com.staynest.reservation.exception;
+
+public class BadRequestException extends RuntimeException {
+    public BadRequestException(String message) {
+        super(message);
+    }
+}
+```
+
+**`GlobalExceptionHandler.java`** (`com.staynest.reservation.exception`)
+```java
+package com.staynest.reservation.exception;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleNotFound(ResourceNotFoundException ex) {
+        return buildError(HttpStatus.NOT_FOUND, ex.getMessage());
+    }
+
+    @ExceptionHandler(BadRequestException.class)
+    public ResponseEntity<Map<String, Object>> handleBadRequest(BadRequestException ex) {
+        return buildError(HttpStatus.BAD_REQUEST, ex.getMessage());
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<Map<String, Object>> handleGeneric(Exception ex) {
+        log.error("Unexpected error: ", ex);
+        return buildError(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred");
+    }
+
+    private ResponseEntity<Map<String, Object>> buildError(HttpStatus status, String message) {
+        Map<String, Object> error = new HashMap<>();
+        error.put("timestamp", LocalDateTime.now());
+        error.put("status", status.value());
+        error.put("error", status.getReasonPhrase());
+        error.put("message", message);
+        return new ResponseEntity<>(error, status);
+    }
+}
+```
+
+---
+
+### DTOs
+
+**`ApiResponse.java`** (`com.staynest.reservation.dto`)
+```java
+package com.staynest.reservation.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class ApiResponse<T> {
+    private boolean success;
+    private String message;
+    private T data;
+    private long timestamp;
+
+    public static <T> ApiResponse<T> success(T data) {
+        return ApiResponse.<T>builder().success(true).data(data).timestamp(System.currentTimeMillis()).build();
+    }
+
+    public static <T> ApiResponse<T> success(String message, T data) {
+        return ApiResponse.<T>builder().success(true).message(message).data(data).timestamp(System.currentTimeMillis()).build();
+    }
+
+    public static <T> ApiResponse<T> error(String message) {
+        return ApiResponse.<T>builder().success(false).message(message).timestamp(System.currentTimeMillis()).build();
+    }
+}
+```
+
+**`GuestProfileRequest.java`** (`com.staynest.reservation.dto`)
+```java
+package com.staynest.reservation.dto;
+
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import lombok.Data;
+
+@Data
+public class GuestProfileRequest {
+    @NotBlank
+    private String name;
+    @NotBlank @Email
+    private String email;
+    private String phone;
+    private String nationality;
+    private String idDocumentType;
+    private String idNumber;
+    private String preferencesJson;
+}
+```
+
+**`GuestProfileResponse.java`** (`com.staynest.reservation.dto`)
+```java
+package com.staynest.reservation.dto;
+
+import com.staynest.reservation.enums.GuestStatus;
+import com.staynest.reservation.enums.LoyaltyTier;
+import lombok.Builder;
+import lombok.Data;
+
+@Data
+@Builder
+public class GuestProfileResponse {
+    private Integer guestId;
+    private String name;
+    private String email;
+    private String phone;
+    private String nationality;
+    private String idDocumentType;
+    private String idNumber;
+    private String preferencesJson;
+    private LoyaltyTier loyaltyTier;
+    private GuestStatus status;
+}
+```
+
+**`ReservationRequest.java`** (`com.staynest.reservation.dto`)
+```java
+package com.staynest.reservation.dto;
+
+import com.staynest.reservation.enums.BookingChannel;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
+import lombok.Data;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+
+@Data
+public class ReservationRequest {
+    @NotNull
+    private Integer guestId;
+    @NotNull
+    private Integer roomTypeId;
+    @NotNull
+    private Integer ratePlanId;
+    @NotNull
+    private LocalDate checkInDate;
+    @NotNull
+    private LocalDate checkOutDate;
+    @NotNull @Positive
+    private Integer nights;
+    @NotNull @Positive
+    private Integer adults;
+    private Integer children;
+    @NotNull @Positive
+    private BigDecimal totalAmount;
+    private BookingChannel bookingChannel;
+}
+```
+
+**`ReservationResponse.java`** (`com.staynest.reservation.dto`)
+```java
+package com.staynest.reservation.dto;
+
+import com.staynest.reservation.enums.BookingChannel;
+import com.staynest.reservation.enums.ReservationStatus;
+import lombok.Builder;
+import lombok.Data;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+
+@Data
+@Builder
+public class ReservationResponse {
+    private Integer reservationId;
+    private Integer guestId;
+    private String guestName;
+    private Integer roomTypeId;
+    private Integer ratePlanId;
+    private LocalDate checkInDate;
+    private LocalDate checkOutDate;
+    private Integer nights;
+    private Integer adults;
+    private Integer children;
+    private BigDecimal totalAmount;
+    private BookingChannel bookingChannel;
+    private ReservationStatus status;
+}
+```
+
+---
+
+### Feign Client (to Room Service for validation)
+
+**`RoomServiceClient.java`** (`com.staynest.reservation.client`)
+```java
+package com.staynest.reservation.client;
+
+import com.staynest.reservation.dto.ApiResponse;
+import org.springframework.cloud.openfeign.FeignClient;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+
+@FeignClient(name = "room-service")
+public interface RoomServiceClient {
+
+    @GetMapping("/api/room-types/{id}")
+    ApiResponse<?> getRoomTypeById(@PathVariable Integer id);
+
+    @GetMapping("/api/rate-plans/{id}")
+    ApiResponse<?> getRatePlanById(@PathVariable Integer id);
+}
+```
+
+---
+
+### Entities
+
+**`GuestProfile.java`** (`com.staynest.reservation.entity`)
+```java
+package com.staynest.reservation.entity;
+
+import com.staynest.reservation.enums.GuestStatus;
+import com.staynest.reservation.enums.LoyaltyTier;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "guest_profiles")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class GuestProfile {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "GuestID")
+    private Integer guestId;
+
+    @Column(name = "Name", nullable = false, length = 100)
+    private String name;
+
+    @Column(name = "Email", nullable = false, unique = true, length = 150)
+    private String email;
+
+    @Column(name = "Phone", length = 20)
+    private String phone;
+
+    @Column(name = "Nationality", length = 50)
+    private String nationality;
+
+    @Column(name = "IDDocumentType", length = 50)
+    private String idDocumentType;
+
+    @Column(name = "IDNumber", length = 100)
+    private String idNumber;
+
+    @Column(name = "PreferencesJSON", columnDefinition = "TEXT")
+    private String preferencesJson;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "LoyaltyTier")
+    @Builder.Default
+    private LoyaltyTier loyaltyTier = LoyaltyTier.NONE;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Status", nullable = false)
+    @Builder.Default
+    private GuestStatus status = GuestStatus.ACTIVE;
+
+    @CreationTimestamp
+    @Column(name = "CreatedAt", updatable = false)
+    private LocalDateTime createdAt;
+
+    @UpdateTimestamp
+    @Column(name = "UpdatedAt")
+    private LocalDateTime updatedAt;
+}
+```
+
+**`Reservation.java`** (`com.staynest.reservation.entity`)
+```java
+package com.staynest.reservation.entity;
+
+import com.staynest.reservation.enums.BookingChannel;
+import com.staynest.reservation.enums.ReservationStatus;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "reservations")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class Reservation {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "ReservationID")
+    private Integer reservationId;
+
+    @ManyToOne
+    @JoinColumn(name = "GuestID", nullable = false)
+    private GuestProfile guest;
+
+    @Column(name = "RoomTypeID", nullable = false)
+    private Integer roomTypeId;
+
+    @Column(name = "RatePlanID", nullable = false)
+    private Integer ratePlanId;
+
+    @Column(name = "CheckInDate", nullable = false)
+    private LocalDate checkInDate;
+
+    @Column(name = "CheckOutDate", nullable = false)
+    private LocalDate checkOutDate;
+
+    @Column(name = "Nights", nullable = false)
+    private Integer nights;
+
+    @Column(name = "Adults", nullable = false)
+    private Integer adults;
+
+    @Column(name = "Children")
+    private Integer children;
+
+    @Column(name = "TotalAmount", nullable = false, precision = 10, scale = 2)
+    private BigDecimal totalAmount;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "BookingChannel")
+    @Builder.Default
+    private BookingChannel bookingChannel = BookingChannel.DIRECT;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Status", nullable = false)
+    @Builder.Default
+    private ReservationStatus status = ReservationStatus.CONFIRMED;
+
+    @CreationTimestamp
+    @Column(name = "CreatedAt", updatable = false)
+    private LocalDateTime createdAt;
+
+    @UpdateTimestamp
+    @Column(name = "UpdatedAt")
+    private LocalDateTime updatedAt;
+}
+```
+
+---
+
+### Repositories
+
+**`GuestProfileRepository.java`** (`com.staynest.reservation.repository`)
+```java
+package com.staynest.reservation.repository;
+
+import com.staynest.reservation.entity.GuestProfile;
+import com.staynest.reservation.enums.GuestStatus;
+import com.staynest.reservation.enums.LoyaltyTier;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+import java.util.Optional;
+
+@Repository
+public interface GuestProfileRepository extends JpaRepository<GuestProfile, Integer> {
+    Optional<GuestProfile> findByEmail(String email);
+    List<GuestProfile> findByStatus(GuestStatus status);
+    List<GuestProfile> findByLoyaltyTier(LoyaltyTier loyaltyTier);
+    boolean existsByEmail(String email);
+}
+```
+
+**`ReservationRepository.java`** (`com.staynest.reservation.repository`)
+```java
+package com.staynest.reservation.repository;
+
+import com.staynest.reservation.entity.Reservation;
+import com.staynest.reservation.enums.ReservationStatus;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.time.LocalDate;
+import java.util.List;
+
+@Repository
+public interface ReservationRepository extends JpaRepository<Reservation, Integer> {
+    List<Reservation> findByGuest_GuestId(Integer guestId);
+    List<Reservation> findByStatus(ReservationStatus status);
+    List<Reservation> findByCheckInDate(LocalDate checkInDate);
+    List<Reservation> findByCheckInDateBetween(LocalDate start, LocalDate end);
+}
+```
+
+---
+
+### Services
+
+**`GuestProfileService.java`** (`com.staynest.reservation.service`)
+```java
+package com.staynest.reservation.service;
+
+import com.staynest.reservation.dto.GuestProfileRequest;
+import com.staynest.reservation.dto.GuestProfileResponse;
+import com.staynest.reservation.entity.GuestProfile;
+import com.staynest.reservation.enums.GuestStatus;
+import com.staynest.reservation.enums.LoyaltyTier;
+import com.staynest.reservation.exception.BadRequestException;
+import com.staynest.reservation.exception.ResourceNotFoundException;
+import com.staynest.reservation.repository.GuestProfileRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class GuestProfileService {
+
+    private final GuestProfileRepository guestProfileRepository;
+
+    public GuestProfileResponse createGuestProfile(GuestProfileRequest request) {
+        if (guestProfileRepository.existsByEmail(request.getEmail())) {
+            throw new BadRequestException("Email already exists: " + request.getEmail());
+        }
+
+        GuestProfile guest = GuestProfile.builder()
+                .name(request.getName())
+                .email(request.getEmail())
+                .phone(request.getPhone())
+                .nationality(request.getNationality())
+                .idDocumentType(request.getIdDocumentType())
+                .idNumber(request.getIdNumber())
+                .preferencesJson(request.getPreferencesJson())
+                .build();
+
+        GuestProfile saved = guestProfileRepository.save(guest);
+        log.info("GuestProfile created: {}", saved.getGuestId());
+        return mapToResponse(saved);
+    }
+
+    public GuestProfileResponse getGuestById(Integer id) {
+        GuestProfile guest = guestProfileRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Guest not found: " + id));
+        return mapToResponse(guest);
+    }
+
+    public GuestProfileResponse getGuestByEmail(String email) {
+        GuestProfile guest = guestProfileRepository.findByEmail(email)
+                .orElseThrow(() -> new ResourceNotFoundException("Guest not found with email: " + email));
+        return mapToResponse(guest);
+    }
+
+    public List<GuestProfileResponse> getAllGuests() {
+        return guestProfileRepository.findAll().stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    public GuestProfileResponse updateLoyaltyTier(Integer id, LoyaltyTier tier) {
+        GuestProfile guest = guestProfileRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Guest not found: " + id));
+        guest.setLoyaltyTier(tier);
+        GuestProfile updated = guestProfileRepository.save(guest);
+        log.info("Guest {} loyalty tier updated to {}", id, tier);
+        return mapToResponse(updated);
+    }
+
+    public GuestProfileResponse blacklistGuest(Integer id) {
+        GuestProfile guest = guestProfileRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Guest not found: " + id));
+        guest.setStatus(GuestStatus.BLACKLISTED);
+        GuestProfile updated = guestProfileRepository.save(guest);
+        log.info("Guest {} blacklisted", id);
+        return mapToResponse(updated);
+    }
+
+    private GuestProfileResponse mapToResponse(GuestProfile guest) {
+        return GuestProfileResponse.builder()
+                .guestId(guest.getGuestId())
+                .name(guest.getName())
+                .email(guest.getEmail())
+                .phone(guest.getPhone())
+                .nationality(guest.getNationality())
+                .idDocumentType(guest.getIdDocumentType())
+                .idNumber(guest.getIdNumber())
+                .preferencesJson(guest.getPreferencesJson())
+                .loyaltyTier(guest.getLoyaltyTier())
+                .status(guest.getStatus())
+                .build();
+    }
+}
+```
+
+**`ReservationService.java`** (`com.staynest.reservation.service`)
+```java
+package com.staynest.reservation.service;
+
+import com.staynest.reservation.client.RoomServiceClient;
+import com.staynest.reservation.dto.ReservationRequest;
+import com.staynest.reservation.dto.ReservationResponse;
+import com.staynest.reservation.entity.GuestProfile;
+import com.staynest.reservation.entity.Reservation;
+import com.staynest.reservation.enums.ReservationStatus;
+import com.staynest.reservation.exception.BadRequestException;
+import com.staynest.reservation.exception.ResourceNotFoundException;
+import com.staynest.reservation.repository.GuestProfileRepository;
+import com.staynest.reservation.repository.ReservationRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDate;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class ReservationService {
+
+    private final ReservationRepository reservationRepository;
+    private final GuestProfileRepository guestProfileRepository;
+    private final RoomServiceClient roomServiceClient;
+
+    @Transactional
+    public ReservationResponse createReservation(ReservationRequest request) {
+        // Validate guest exists
+        GuestProfile guest = guestProfileRepository.findById(request.getGuestId())
+                .orElseThrow(() -> new BadRequestException("Invalid GuestId: " + request.getGuestId()));
+
+        // Validate roomType and ratePlan exist (cross-service via Feign)
+        try {
+            roomServiceClient.getRoomTypeById(request.getRoomTypeId());
+        } catch (Exception e) {
+            throw new BadRequestException("Invalid RoomTypeId: " + request.getRoomTypeId());
+        }
+
+        try {
+            roomServiceClient.getRatePlanById(request.getRatePlanId());
+        } catch (Exception e) {
+            throw new BadRequestException("Invalid RatePlanId: " + request.getRatePlanId());
+        }
+
+        Reservation reservation = Reservation.builder()
+                .guest(guest)
+                .roomTypeId(request.getRoomTypeId())
+                .ratePlanId(request.getRatePlanId())
+                .checkInDate(request.getCheckInDate())
+                .checkOutDate(request.getCheckOutDate())
+                .nights(request.getNights())
+                .adults(request.getAdults())
+                .children(request.getChildren())
+                .totalAmount(request.getTotalAmount())
+                .bookingChannel(request.getBookingChannel())
+                .build();
+
+        Reservation saved = reservationRepository.save(reservation);
+        log.info("Reservation created: {}", saved.getReservationId());
+        return mapToResponse(saved);
+    }
+
+    public ReservationResponse getReservationById(Integer id) {
+        Reservation reservation = reservationRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Reservation not found: " + id));
+        return mapToResponse(reservation);
+    }
+
+    public List<ReservationResponse> getAllReservations() {
+        return reservationRepository.findAll().stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    public List<ReservationResponse> getReservationsByGuest(Integer guestId) {
+        return reservationRepository.findByGuest_GuestId(guestId).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    public List<ReservationResponse> getReservationsByStatus(ReservationStatus status) {
+        return reservationRepository.findByStatus(status).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    public List<ReservationResponse> getUpcomingReservations(LocalDate date) {
+        return reservationRepository.findByCheckInDateBetween(date, date.plusDays(30)).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Transactional
+    public ReservationResponse cancelReservation(Integer id) {
+        Reservation reservation = reservationRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Reservation not found: " + id));
+
+        if (reservation.getStatus() == ReservationStatus.CHECKEDIN) {
+            throw new BadRequestException("Cannot cancel a checked-in reservation");
+        }
+
+        reservation.setStatus(ReservationStatus.CANCELLED);
+        Reservation updated = reservationRepository.save(reservation);
+        log.info("Reservation {} cancelled", id);
+        return mapToResponse(updated);
+    }
+
+    @Transactional
+    public ReservationResponse updateReservationStatus(Integer id, ReservationStatus status) {
+        Reservation reservation = reservationRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Reservation not found: " + id));
+        reservation.setStatus(status);
+        Reservation updated = reservationRepository.save(reservation);
+        log.info("Reservation {} status updated to {}", id, status);
+        return mapToResponse(updated);
+    }
+
+    private ReservationResponse mapToResponse(Reservation r) {
+        return ReservationResponse.builder()
+                .reservationId(r.getReservationId())
+                .guestId(r.getGuest().getGuestId())
+                .guestName(r.getGuest().getName())
+                .roomTypeId(r.getRoomTypeId())
+                .ratePlanId(r.getRatePlanId())
+                .checkInDate(r.getCheckInDate())
+                .checkOutDate(r.getCheckOutDate())
+                .nights(r.getNights())
+                .adults(r.getAdults())
+                .children(r.getChildren())
+                .totalAmount(r.getTotalAmount())
+                .bookingChannel(r.getBookingChannel())
+                .status(r.getStatus())
+                .build();
+    }
+}
+```
+
+---
+
+### Controllers
+
+**`GuestProfileController.java`** (`com.staynest.reservation.controller`)
+```java
+package com.staynest.reservation.controller;
+
+import com.staynest.reservation.dto.ApiResponse;
+import com.staynest.reservation.dto.GuestProfileRequest;
+import com.staynest.reservation.dto.GuestProfileResponse;
+import com.staynest.reservation.enums.LoyaltyTier;
+import com.staynest.reservation.service.GuestProfileService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@Slf4j
+@RestController
+@RequestMapping("/api/guests")
+@RequiredArgsConstructor
+public class GuestProfileController {
+
+    private final GuestProfileService guestProfileService;
+
+    @PostMapping
+    @PreAuthorize("hasAnyRole('ADMIN', 'FRONTDESK')")
+    public ResponseEntity<ApiResponse<GuestProfileResponse>> create(@Valid @RequestBody GuestProfileRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success("Guest created", guestProfileService.createGuestProfile(request)));
+    }
+
+    @GetMapping
+    @PreAuthorize("hasAnyRole('ADMIN', 'FRONTDESK', 'REVENUEMANAGER')")
+    public ResponseEntity<ApiResponse<List<GuestProfileResponse>>> getAll() {
+        return ResponseEntity.ok(ApiResponse.success(guestProfileService.getAllGuests()));
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<ApiResponse<GuestProfileResponse>> getById(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success(guestProfileService.getGuestById(id)));
+    }
+
+    @GetMapping("/email/{email}")
+    public ResponseEntity<ApiResponse<GuestProfileResponse>> getByEmail(@PathVariable String email) {
+        return ResponseEntity.ok(ApiResponse.success(guestProfileService.getGuestByEmail(email)));
+    }
+
+    @PatchMapping("/{id}/loyalty")
+    @PreAuthorize("hasAnyRole('ADMIN', 'REVENUEMANAGER')")
+    public ResponseEntity<ApiResponse<GuestProfileResponse>> updateLoyalty(
+            @PathVariable Integer id,
+            @RequestParam LoyaltyTier tier) {
+        return ResponseEntity.ok(ApiResponse.success(guestProfileService.updateLoyaltyTier(id, tier)));
+    }
+
+    @PatchMapping("/{id}/blacklist")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<ApiResponse<GuestProfileResponse>> blacklist(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success(guestProfileService.blacklistGuest(id)));
+    }
+}
+```
+
+**`ReservationController.java`** (`com.staynest.reservation.controller`)
+```java
+package com.staynest.reservation.controller;
+
+import com.staynest.reservation.dto.ApiResponse;
+import com.staynest.reservation.dto.ReservationRequest;
+import com.staynest.reservation.dto.ReservationResponse;
+import com.staynest.reservation.enums.ReservationStatus;
+import com.staynest.reservation.service.ReservationService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.LocalDate;
+import java.util.List;
+
+@Slf4j
+@RestController
+@RequestMapping("/api/reservations")
+@RequiredArgsConstructor
+public class ReservationController {
+
+    private final ReservationService reservationService;
+
+    @PostMapping
+    @PreAuthorize("hasAnyRole('ADMIN', 'FRONTDESK', 'GUEST')")
+    public ResponseEntity<ApiResponse<ReservationResponse>> create(@Valid @RequestBody ReservationRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success("Reservation created", reservationService.createReservation(request)));
+    }
+
+    @GetMapping
+    @PreAuthorize("hasAnyRole('ADMIN', 'FRONTDESK', 'REVENUEMANAGER')")
+    public ResponseEntity<ApiResponse<List<ReservationResponse>>> getAll(
+            @RequestParam(required = false) Integer guestId,
+            @RequestParam(required = false) ReservationStatus status) {
+        if (guestId != null) {
+            return ResponseEntity.ok(ApiResponse.success(reservationService.getReservationsByGuest(guestId)));
+        }
+        if (status != null) {
+            return ResponseEntity.ok(ApiResponse.success(reservationService.getReservationsByStatus(status)));
+        }
+        return ResponseEntity.ok(ApiResponse.success(reservationService.getAllReservations()));
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<ApiResponse<ReservationResponse>> getById(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success(reservationService.getReservationById(id)));
+    }
+
+    @PatchMapping("/{id}/cancel")
+    public ResponseEntity<ApiResponse<ReservationResponse>> cancel(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success("Reservation cancelled", reservationService.cancelReservation(id)));
+    }
+
+    @PatchMapping("/{id}/status")
+    @PreAuthorize("hasAnyRole('ADMIN', 'FRONTDESK')")
+    public ResponseEntity<ApiResponse<ReservationResponse>> updateStatus(
+            @PathVariable Integer id,
+            @RequestParam ReservationStatus status) {
+        return ResponseEntity.ok(ApiResponse.success(reservationService.updateReservationStatus(id, status)));
+    }
+
+    @GetMapping("/upcoming")
+    public ResponseEntity<ApiResponse<List<ReservationResponse>>> getUpcoming(
+            @RequestParam(required = false) LocalDate date) {
+        LocalDate searchDate = date != null ? date : LocalDate.now();
+        return ResponseEntity.ok(ApiResponse.success(reservationService.getUpcomingReservations(searchDate)));
+    }
+}
+```
+
+---
+
+### JUnit Tests
+
+**`GuestProfileServiceTest.java`** (`com.staynest.reservation.service`)
+```java
+package com.staynest.reservation.service;
+
+import com.staynest.reservation.dto.GuestProfileRequest;
+import com.staynest.reservation.entity.GuestProfile;
+import com.staynest.reservation.enums.GuestStatus;
+import com.staynest.reservation.enums.LoyaltyTier;
+import com.staynest.reservation.exception.BadRequestException;
+import com.staynest.reservation.exception.ResourceNotFoundException;
+import com.staynest.reservation.repository.GuestProfileRepository;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.util.Optional;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class GuestProfileServiceTest {
+
+    @Mock private GuestProfileRepository guestProfileRepository;
+    @InjectMocks private GuestProfileService guestProfileService;
+
+    private GuestProfileRequest request;
+    private GuestProfile guest;
+
+    @BeforeEach
+    void setUp() {
+        request = new GuestProfileRequest();
+        request.setName("John Doe");
+        request.setEmail("john@example.com");
+        request.setPhone("1234567890");
+
+        guest = GuestProfile.builder()
+                .guestId(1).name("John Doe").email("john@example.com")
+                .phone("1234567890").status(GuestStatus.ACTIVE)
+                .loyaltyTier(LoyaltyTier.NONE).build();
+    }
+
+    @Test
+    void createProfile_valid_shouldCreate() {
+        when(guestProfileRepository.existsByEmail(anyString())).thenReturn(false);
+        when(guestProfileRepository.save(any(GuestProfile.class))).thenReturn(guest);
+
+        var response = guestProfileService.createGuestProfile(request);
+        assertNotNull(response);
+        assertEquals("John Doe", response.getName());
+    }
+
+    @Test
+    void createProfile_duplicateEmail_shouldThrow() {
+        when(guestProfileRepository.existsByEmail(anyString())).thenReturn(true);
+        assertThrows(BadRequestException.class, () -> guestProfileService.createGuestProfile(request));
+    }
+
+    @Test
+    void getByEmail_valid_shouldReturn() {
+        when(guestProfileRepository.findByEmail("john@example.com")).thenReturn(Optional.of(guest));
+        var response = guestProfileService.getGuestByEmail("john@example.com");
+        assertEquals("John Doe", response.getName());
+    }
+
+    @Test
+    void getByEmail_invalid_shouldThrow() {
+        when(guestProfileRepository.findByEmail("notfound@example.com")).thenReturn(Optional.empty());
+        assertThrows(ResourceNotFoundException.class, () -> guestProfileService.getGuestByEmail("notfound@example.com"));
+    }
+}
+```
+
+**`ReservationServiceTest.java`** (`com.staynest.reservation.service`)
+```java
+package com.staynest.reservation.service;
+
+import com.staynest.reservation.client.RoomServiceClient;
+import com.staynest.reservation.dto.ReservationRequest;
+import com.staynest.reservation.entity.GuestProfile;
+import com.staynest.reservation.entity.Reservation;
+import com.staynest.reservation.enums.ReservationStatus;
+import com.staynest.reservation.exception.BadRequestException;
+import com.staynest.reservation.repository.GuestProfileRepository;
+import com.staynest.reservation.repository.ReservationRepository;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.util.Optional;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class ReservationServiceTest {
+
+    @Mock private ReservationRepository reservationRepository;
+    @Mock private GuestProfileRepository guestProfileRepository;
+    @Mock private RoomServiceClient roomServiceClient;
+    @InjectMocks private ReservationService reservationService;
+
+    private GuestProfile guest;
+    private Reservation reservation;
+    private ReservationRequest request;
+
+    @BeforeEach
+    void setUp() {
+        guest = GuestProfile.builder().guestId(1).name("John").build();
+
+        request = new ReservationRequest();
+        request.setGuestId(1);
+        request.setRoomTypeId(1);
+        request.setRatePlanId(1);
+        request.setCheckInDate(LocalDate.now());
+        request.setCheckOutDate(LocalDate.now().plusDays(2));
+        request.setNights(2);
+        request.setAdults(2);
+        request.setTotalAmount(new BigDecimal("5000"));
+
+        reservation = Reservation.builder()
+                .reservationId(1).guest(guest).roomTypeId(1).ratePlanId(1)
+                .checkInDate(LocalDate.now()).checkOutDate(LocalDate.now().plusDays(2))
+                .nights(2).adults(2).totalAmount(new BigDecimal("5000"))
+                .status(ReservationStatus.CONFIRMED).build();
+    }
+
+    @Test
+    void createReservation_valid_shouldCreate() {
+        when(guestProfileRepository.findById(1)).thenReturn(Optional.of(guest));
+        when(reservationRepository.save(any(Reservation.class))).thenReturn(reservation);
+
+        var response = reservationService.createReservation(request);
+        assertNotNull(response);
+        assertEquals(ReservationStatus.CONFIRMED, response.getStatus());
+    }
+
+    @Test
+    void cancelReservation_confirmed_shouldCancel() {
+        when(reservationRepository.findById(1)).thenReturn(Optional.of(reservation));
+        when(reservationRepository.save(any(Reservation.class))).thenReturn(reservation);
+
+        var response = reservationService.cancelReservation(1);
+        assertEquals(ReservationStatus.CANCELLED, response.getStatus());
+    }
+
+    @Test
+    void cancelReservation_checkedIn_shouldThrow() {
+        reservation.setStatus(ReservationStatus.CHECKEDIN);
+        when(reservationRepository.findById(1)).thenReturn(Optional.of(reservation));
+
+        assertThrows(BadRequestException.class, () -> reservationService.cancelReservation(1));
+    }
+
+    @Test
+    void getUpcomingReservations_shouldReturnCorrect() {
+        when(reservationRepository.findByCheckInDateBetween(any(), any()))
+                .thenReturn(java.util.List.of(reservation));
+
+        var upcoming = reservationService.getUpcomingReservations(LocalDate.now());
+        assertEquals(1, upcoming.size());
+    }
+}
+```
+
+---
+
+## Seed Data (MySQL)
+
+```sql
+USE staynest_reservation_db;
+
+-- Seed 3 guest profiles
+INSERT INTO guest_profiles (Name, Email, Phone, Nationality, IDDocumentType, IDNumber, PreferencesJSON, LoyaltyTier, Status) VALUES
+('Alice Guest', 'alice@guest.com', '1111111111', 'USA', 'Passport', 'P123456', '{"smoking": false}', 'SILVER', 'ACTIVE'),
+('Bob Smith', 'bob@example.com', '2222222222', 'UK', 'Passport', 'P789012', '{"smoking": true}', 'GOLD', 'ACTIVE'),
+('Charlie Brown', 'charlie@example.com', '3333333333', 'India', 'Aadhaar', 'A123456789', '{"breakfast": true}', 'NONE', 'ACTIVE');
+
+-- Seed 4 reservations
+INSERT INTO reservations (GuestID, RoomTypeID, RatePlanID, CheckInDate, CheckOutDate, Nights, Adults, Children, TotalAmount, BookingChannel, Status) VALUES
+(1, 1, 1, '2026-07-25', '2026-07-27', 2, 2, 0, 8000.00, 'DIRECT', 'CONFIRMED'),
+(2, 2, 2, '2026-07-20', '2026-07-22', 2, 1, 0, 12000.00, 'PHONE', 'CHECKEDIN'),
+(1, 1, 1, '2026-08-01', '2026-08-05', 4, 2, 1, 16000.00, 'DIRECT', 'CANCELLED'),
+(3, 3, 3, '2026-07-18', '2026-07-19', 1, 2, 0, 25000.00, 'WALKIN', 'NOSHOW');
+```
+
+---
+
+## What You've Built So Far
+
+| Service | Port | Status |
+|---------|------|--------|
+| Eureka Server | 8761 | ✅ Complete |
+| API Gateway | 8080 | ✅ Complete |
+| IAM Service | 8081 | ✅ Complete |
+| Room Service | 8082 | ✅ Complete |
+| **Reservation Service** | **8083** | **✅ Complete** |
+
+---
+
+## Next Up
+
+Tell me which service to generate next:
+
+- **Phase 4**: Front Desk Service (Port 8084) + Housekeeping Service (Port 8085)
+- **Phase 5**: F&B Service (Port 8086) + Notification Service (Port 8088)
+- **Phase 6**: Revenue Service (Port 8087)
+
+Or if you want both Front Desk and Housekeeping together (since they share the same BE-Stories-S3 in your Excel), just say **"Phase 4"** and I'll generate both! 🚀
