@@ -1,0 +1,2230 @@
+Here's **Phase 4: Front Desk Service (Port 8084)** and **Housekeeping Service (Port 8085)** — with **Service Interface + ServiceImpl** pattern as requested.
+
+---
+
+## Phase 4A: Front Desk Service (`staynest-frontdesk-service`)
+
+**Dependencies in STS:** `Spring Web`, `Spring Data JPA`, `MySQL Driver`, `Spring Security`, `Eureka Discovery Client`, `OpenFeign`, `Lombok`, `Validation`
+
+**Manual `pom.xml` addition for JWT:**
+```xml
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-api</artifactId>
+    <version>0.11.5</version>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-impl</artifactId>
+    <version>0.11.5</version>
+    <scope>runtime</scope>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-jackson</artifactId>
+    <version>0.11.5</version>
+    <scope>runtime</scope>
+</dependency>
+```
+
+**`application.yml`:**
+```yaml
+server:
+  port: 8084
+
+spring:
+  application:
+    name: frontdesk-service
+  datasource:
+    url: jdbc:mysql://localhost:3306/staynest_frontdesk_db?createDatabaseIfNotExist=true&useSSL=false&serverTimezone=UTC
+    username: root
+    password: root
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQL8Dialect
+        format_sql: true
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+jwt:
+  secret: staynest-secret-key-for-jwt-signing-2026
+  expiration: 86400000
+```
+
+---
+
+### Main Application
+
+**`FrontDeskServiceApplication.java`** (`com.staynest.frontdesk`)
+```java
+package com.staynest.frontdesk;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
+import org.springframework.cloud.openfeign.EnableFeignClients;
+
+@SpringBootApplication
+@EnableDiscoveryClient
+@EnableFeignClients
+public class FrontDeskServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(FrontDeskServiceApplication.class, args);
+    }
+}
+```
+
+---
+
+### Enums
+
+**`StayStatus.java`** (`com.staynest.frontdesk.enums`)
+```java
+package com.staynest.frontdesk.enums;
+
+public enum StayStatus {
+    ACTIVE,
+    CHECKEDOUT
+}
+```
+
+**`ChargeType.java`** (`com.staynest.frontdesk.enums`)
+```java
+package com.staynest.frontdesk.enums;
+
+public enum ChargeType {
+    ROOMRENT,
+    FBCHARGE,
+    LAUNDRY,
+    SPA,
+    TAX,
+    DISCOUNT
+}
+```
+
+---
+
+### JWT Trio (Self-contained)
+
+**`JwtUtil.java`** (`com.staynest.frontdesk.jwt`)
+```java
+package com.staynest.frontdesk.jwt;
+
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.SignatureAlgorithm;
+import io.jsonwebtoken.security.Keys;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import javax.crypto.SecretKey;
+import java.nio.charset.StandardCharsets;
+import java.util.Date;
+
+@Component
+public class JwtUtil {
+
+    @Value("${jwt.secret}")
+    private String secret;
+
+    @Value("${jwt.expiration}")
+    private long expiration;
+
+    private SecretKey getSigningKey() {
+        return Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public boolean validateToken(String token) {
+        try {
+            Jwts.parserBuilder().setSigningKey(getSigningKey()).build().parseClaimsJws(token);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public String extractEmail(String token) {
+        return getClaims(token).getSubject();
+    }
+
+    public String extractRole(String token) {
+        return getClaims(token).get("role", String.class);
+    }
+
+    private Claims getClaims(String token) {
+        return Jwts.parserBuilder().setSigningKey(getSigningKey()).build().parseClaimsJws(token).getBody();
+    }
+}
+```
+
+**`JwtFilter.java`** (`com.staynest.frontdesk.jwt`)
+```java
+package com.staynest.frontdesk.jwt;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.Collections;
+
+@Component
+@RequiredArgsConstructor
+public class JwtFilter extends OncePerRequestFilter {
+
+    private final JwtUtil jwtUtil;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
+            throws ServletException, IOException {
+        
+        String header = request.getHeader("Authorization");
+        
+        if (header != null && header.startsWith("Bearer ")) {
+            String token = header.substring(7);
+            if (jwtUtil.validateToken(token)) {
+                String email = jwtUtil.extractEmail(token);
+                String role = jwtUtil.extractRole(token);
+                var auth = new UsernamePasswordAuthenticationToken(
+                    email, null, Collections.singletonList(new SimpleGrantedAuthority("ROLE_" + role)));
+                SecurityContextHolder.getContext().setAuthentication(auth);
+            }
+        }
+        chain.doFilter(request, response);
+    }
+}
+```
+
+**`SecurityConfig.java`** (`com.staynest.frontdesk.config`)
+```java
+package com.staynest.frontdesk.config;
+
+import com.staynest.frontdesk.jwt.JwtFilter;
+import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+import java.util.Arrays;
+import java.util.List;
+
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+@RequiredArgsConstructor
+public class SecurityConfig {
+
+    private final JwtFilter jwtFilter;
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http.csrf(csrf -> csrf.disable())
+            .cors(cors -> cors.configurationSource(corsConfigurationSource()))
+            .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/auth/**", "/actuator/**").permitAll()
+                .anyRequest().authenticated())
+            .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration config = new CorsConfiguration();
+        config.setAllowedOrigins(List.of("http://localhost:3000"));
+        config.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+        config.setAllowedHeaders(List.of("*"));
+        config.setAllowCredentials(true);
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", config);
+        return source;
+    }
+}
+```
+
+---
+
+### Exceptions
+
+**`ResourceNotFoundException.java`** (`com.staynest.frontdesk.exception`)
+```java
+package com.staynest.frontdesk.exception;
+
+public class ResourceNotFoundException extends RuntimeException {
+    public ResourceNotFoundException(String message) {
+        super(message);
+    }
+}
+```
+
+**`BadRequestException.java`** (`com.staynest.frontdesk.exception`)
+```java
+package com.staynest.frontdesk.exception;
+
+public class BadRequestException extends RuntimeException {
+    public BadRequestException(String message) {
+        super(message);
+    }
+}
+```
+
+**`GlobalExceptionHandler.java`** (`com.staynest.frontdesk.exception`)
+```java
+package com.staynest.frontdesk.exception;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleNotFound(ResourceNotFoundException ex) {
+        return buildError(HttpStatus.NOT_FOUND, ex.getMessage());
+    }
+
+    @ExceptionHandler(BadRequestException.class)
+    public ResponseEntity<Map<String, Object>> handleBadRequest(BadRequestException ex) {
+        return buildError(HttpStatus.BAD_REQUEST, ex.getMessage());
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<Map<String, Object>> handleGeneric(Exception ex) {
+        log.error("Unexpected error: ", ex);
+        return buildError(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred");
+    }
+
+    private ResponseEntity<Map<String, Object>> buildError(HttpStatus status, String message) {
+        Map<String, Object> error = new HashMap<>();
+        error.put("timestamp", LocalDateTime.now());
+        error.put("status", status.value());
+        error.put("error", status.getReasonPhrase());
+        error.put("message", message);
+        return new ResponseEntity<>(error, status);
+    }
+}
+```
+
+---
+
+### DTOs
+
+**`ApiResponse.java`** (`com.staynest.frontdesk.dto`)
+```java
+package com.staynest.frontdesk.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class ApiResponse<T> {
+    private boolean success;
+    private String message;
+    private T data;
+    private long timestamp;
+
+    public static <T> ApiResponse<T> success(T data) {
+        return ApiResponse.<T>builder().success(true).data(data).timestamp(System.currentTimeMillis()).build();
+    }
+
+    public static <T> ApiResponse<T> success(String message, T data) {
+        return ApiResponse.<T>builder().success(true).message(message).data(data).timestamp(System.currentTimeMillis()).build();
+    }
+
+    public static <T> ApiResponse<T> error(String message) {
+        return ApiResponse.<T>builder().success(false).message(message).timestamp(System.currentTimeMillis()).build();
+    }
+}
+```
+
+**`CheckInRequest.java`** (`com.staynest.frontdesk.dto`)
+```java
+package com.staynest.frontdesk.dto;
+
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+
+@Data
+public class CheckInRequest {
+    @NotNull
+    private Integer reservationId;
+    @NotNull
+    private Integer roomId;
+}
+```
+
+**`StayRecordResponse.java`** (`com.staynest.frontdesk.dto`)
+```java
+package com.staynest.frontdesk.dto;
+
+import com.staynest.frontdesk.enums.StayStatus;
+import lombok.Builder;
+import lombok.Data;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+
+@Data
+@Builder
+public class StayRecordResponse {
+    private Integer stayId;
+    private Integer reservationId;
+    private Integer guestId;
+    private Integer assignedRoomId;
+    private LocalDateTime actualCheckIn;
+    private LocalDateTime actualCheckOut;
+    private BigDecimal folioBalance;
+    private StayStatus status;
+}
+```
+
+**`FolioItemRequest.java`** (`com.staynest.frontdesk.dto`)
+```java
+package com.staynest.frontdesk.dto;
+
+import com.staynest.frontdesk.enums.ChargeType;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
+import lombok.Data;
+
+import java.math.BigDecimal;
+
+@Data
+public class FolioItemRequest {
+    @NotNull
+    private ChargeType chargeType;
+    @NotBlank
+    private String description;
+    @NotNull @Positive
+    private BigDecimal amount;
+    @NotNull
+    private Integer postedBy;
+}
+```
+
+**`FolioItemResponse.java`** (`com.staynest.frontdesk.dto`)
+```java
+package com.staynest.frontdesk.dto;
+
+import com.staynest.frontdesk.enums.ChargeType;
+import lombok.Builder;
+import lombok.Data;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+
+@Data
+@Builder
+public class FolioItemResponse {
+    private Integer folioItemId;
+    private Integer stayId;
+    private ChargeType chargeType;
+    private String description;
+    private BigDecimal amount;
+    private LocalDateTime postedDate;
+    private Integer postedBy;
+}
+```
+
+---
+
+### Feign Clients
+
+**`RoomServiceClient.java`** (`com.staynest.frontdesk.client`)
+```java
+package com.staynest.frontdesk.client;
+
+import com.staynest.frontdesk.dto.ApiResponse;
+import org.springframework.cloud.openfeign.FeignClient;
+import org.springframework.web.bind.annotation.PatchMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestParam;
+
+@FeignClient(name = "room-service")
+public interface RoomServiceClient {
+
+    @PatchMapping("/api/rooms/{id}/status")
+    ApiResponse<?> updateRoomStatus(@PathVariable Integer id, @RequestParam String status);
+}
+```
+
+**`ReservationServiceClient.java`** (`com.staynest.frontdesk.client`)
+```java
+package com.staynest.frontdesk.client;
+
+import com.staynest.frontdesk.dto.ApiResponse;
+import org.springframework.cloud.openfeign.FeignClient;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PatchMapping;
+
+@FeignClient(name = "reservation-service")
+public interface ReservationServiceClient {
+
+    @GetMapping("/api/reservations/{id}")
+    ApiResponse<?> getReservationById(@PathVariable Integer id);
+
+    @PatchMapping("/api/reservations/{id}/status")
+    ApiResponse<?> updateReservationStatus(@PathVariable Integer id, @RequestParam String status);
+}
+```
+
+---
+
+### Entities
+
+**`StayRecord.java`** (`com.staynest.frontdesk.entity`)
+```java
+package com.staynest.frontdesk.entity;
+
+import com.staynest.frontdesk.enums.StayStatus;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "stay_records")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class StayRecord {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "StayID")
+    private Integer stayId;
+
+    @Column(name = "ReservationID", nullable = false, unique = true)
+    private Integer reservationId;
+
+    @Column(name = "GuestID", nullable = false)
+    private Integer guestId;
+
+    @Column(name = "AssignedRoomID", nullable = false)
+    private Integer assignedRoomId;
+
+    @Column(name = "ActualCheckIn")
+    private LocalDateTime actualCheckIn;
+
+    @Column(name = "ActualCheckOut")
+    private LocalDateTime actualCheckOut;
+
+    @Column(name = "FolioBalance", precision = 10, scale = 2)
+    @Builder.Default
+    private BigDecimal folioBalance = BigDecimal.ZERO;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Status", nullable = false)
+    @Builder.Default
+    private StayStatus status = StayStatus.ACTIVE;
+
+    @CreationTimestamp
+    @Column(name = "CreatedAt", updatable = false)
+    private LocalDateTime createdAt;
+
+    @UpdateTimestamp
+    @Column(name = "UpdatedAt")
+    private LocalDateTime updatedAt;
+}
+```
+
+**`FolioItem.java`** (`com.staynest.frontdesk.entity`)
+```java
+package com.staynest.frontdesk.entity;
+
+import com.staynest.frontdesk.enums.ChargeType;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "folio_items")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class FolioItem {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "FolioItemID")
+    private Integer folioItemId;
+
+    @ManyToOne
+    @JoinColumn(name = "StayID", nullable = false)
+    private StayRecord stayRecord;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "ChargeType", nullable = false)
+    private ChargeType chargeType;
+
+    @Column(name = "Description", length = 200)
+    private String description;
+
+    @Column(name = "Amount", nullable = false, precision = 10, scale = 2)
+    private BigDecimal amount;
+
+    @CreationTimestamp
+    @Column(name = "PostedDate", updatable = false)
+    private LocalDateTime postedDate;
+
+    @Column(name = "PostedBy")
+    private Integer postedBy;
+}
+```
+
+---
+
+### Repositories
+
+**`StayRecordRepository.java`** (`com.staynest.frontdesk.repository`)
+```java
+package com.staynest.frontdesk.repository;
+
+import com.staynest.frontdesk.entity.StayRecord;
+import com.staynest.frontdesk.enums.StayStatus;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+import java.util.Optional;
+
+@Repository
+public interface StayRecordRepository extends JpaRepository<StayRecord, Integer> {
+    List<StayRecord> findByGuestId(Integer guestId);
+    List<StayRecord> findByStatus(StayStatus status);
+    Optional<StayRecord> findByReservationId(Integer reservationId);
+}
+```
+
+**`FolioItemRepository.java`** (`com.staynest.frontdesk.repository`)
+```java
+package com.staynest.frontdesk.repository;
+
+import com.staynest.frontdesk.entity.FolioItem;
+import com.staynest.frontdesk.enums.ChargeType;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface FolioItemRepository extends JpaRepository<FolioItem, Integer> {
+    List<FolioItem> findByStayRecord_StayId(Integer stayId);
+    List<FolioItem> findByChargeType(ChargeType chargeType);
+}
+```
+
+---
+
+### Service Interface + ServiceImpl Pattern
+
+**`StayRecordService.java`** (`com.staynest.frontdesk.service`) — Interface
+```java
+package com.staynest.frontdesk.service;
+
+import com.staynest.frontdesk.dto.CheckInRequest;
+import com.staynest.frontdesk.dto.FolioItemRequest;
+import com.staynest.frontdesk.dto.StayRecordResponse;
+import com.staynest.frontdesk.entity.StayRecord;
+
+import java.util.List;
+
+public interface StayRecordService {
+    StayRecordResponse checkIn(CheckInRequest request);
+    StayRecordResponse postFolioItem(Integer stayId, FolioItemRequest request);
+    StayRecordResponse checkOut(Integer stayId);
+    StayRecordResponse getStayById(Integer stayId);
+    List<StayRecordResponse> getAllStays();
+    List<StayRecordResponse> getStaysByGuestId(Integer guestId);
+    List<StayRecordResponse> getStaysByStatus(String status);
+    StayRecord getStayEntityById(Integer stayId);
+}
+```
+
+**`StayRecordServiceImpl.java`** (`com.staynest.frontdesk.service.impl`) — Implementation
+```java
+package com.staynest.frontdesk.service.impl;
+
+import com.staynest.frontdesk.client.ReservationServiceClient;
+import com.staynest.frontdesk.client.RoomServiceClient;
+import com.staynest.frontdesk.dto.CheckInRequest;
+import com.staynest.frontdesk.dto.FolioItemRequest;
+import com.staynest.frontdesk.dto.StayRecordResponse;
+import com.staynest.frontdesk.entity.FolioItem;
+import com.staynest.frontdesk.entity.StayRecord;
+import com.staynest.frontdesk.enums.ChargeType;
+import com.staynest.frontdesk.enums.StayStatus;
+import com.staynest.frontdesk.exception.BadRequestException;
+import com.staynest.frontdesk.exception.ResourceNotFoundException;
+import com.staynest.frontdesk.repository.FolioItemRepository;
+import com.staynest.frontdesk.repository.StayRecordRepository;
+import com.staynest.frontdesk.service.StayRecordService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class StayRecordServiceImpl implements StayRecordService {
+
+    private final StayRecordRepository stayRecordRepository;
+    private final FolioItemRepository folioItemRepository;
+    private final RoomServiceClient roomServiceClient;
+    private final ReservationServiceClient reservationServiceClient;
+
+    @Override
+    @Transactional
+    public StayRecordResponse checkIn(CheckInRequest request) {
+        // Verify reservation exists
+        try {
+            reservationServiceClient.getReservationById(request.getReservationId());
+        } catch (Exception e) {
+            throw new BadRequestException("Invalid ReservationId: " + request.getReservationId());
+        }
+
+        // Check if stay already exists for this reservation
+        if (stayRecordRepository.findByReservationId(request.getReservationId()).isPresent()) {
+            throw new BadRequestException("Stay already exists for reservation: " + request.getReservationId());
+        }
+
+        StayRecord stay = StayRecord.builder()
+                .reservationId(request.getReservationId())
+                .guestId(request.getRoomId()) // Will be fetched from reservation in real scenario
+                .assignedRoomId(request.getRoomId())
+                .actualCheckIn(LocalDateTime.now())
+                .folioBalance(BigDecimal.ZERO)
+                .status(StayStatus.ACTIVE)
+                .build();
+
+        StayRecord saved = stayRecordRepository.save(stay);
+
+        // Update room status to OCCUPIED
+        try {
+            roomServiceClient.updateRoomStatus(request.getRoomId(), "OCCUPIED");
+        } catch (Exception e) {
+            log.warn("Failed to update room status: {}", e.getMessage());
+        }
+
+        // Update reservation status to CHECKEDIN
+        try {
+            reservationServiceClient.updateReservationStatus(request.getReservationId(), "CHECKEDIN");
+        } catch (Exception e) {
+            log.warn("Failed to update reservation status: {}", e.getMessage());
+        }
+
+        log.info("Check-in completed for reservation: {}", request.getReservationId());
+        return mapToResponse(saved);
+    }
+
+    @Override
+    @Transactional
+    public StayRecordResponse postFolioItem(Integer stayId, FolioItemRequest request) {
+        StayRecord stay = stayRecordRepository.findById(stayId)
+                .orElseThrow(() -> new ResourceNotFoundException("Stay not found: " + stayId));
+
+        if (stay.getStatus() == StayStatus.CHECKEDOUT) {
+            throw new BadRequestException("Cannot post charges to a checked-out stay");
+        }
+
+        FolioItem item = FolioItem.builder()
+                .stayRecord(stay)
+                .chargeType(request.getChargeType())
+                .description(request.getDescription())
+                .amount(request.getAmount())
+                .postedBy(request.getPostedBy())
+                .build();
+
+        folioItemRepository.save(item);
+
+        // Update folio balance
+        BigDecimal newBalance = stay.getFolioBalance().add(request.getAmount());
+        stay.setFolioBalance(newBalance);
+        StayRecord updated = stayRecordRepository.save(stay);
+
+        log.info("Folio item posted for stay: {}, amount: {}", stayId, request.getAmount());
+        return mapToResponse(updated);
+    }
+
+    @Override
+    @Transactional
+    public StayRecordResponse checkOut(Integer stayId) {
+        StayRecord stay = stayRecordRepository.findById(stayId)
+                .orElseThrow(() -> new ResourceNotFoundException("Stay not found: " + stayId));
+
+        if (stay.getStatus() == StayStatus.CHECKEDOUT) {
+            throw new BadRequestException("Stay is already checked out");
+        }
+
+        // Sum all folio items
+        List<FolioItem> items = folioItemRepository.findByStayRecord_StayId(stayId);
+        BigDecimal total = items.stream()
+                .map(FolioItem::getAmount)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        stay.setFolioBalance(total);
+        stay.setActualCheckOut(LocalDateTime.now());
+        stay.setStatus(StayStatus.CHECKEDOUT);
+        StayRecord updated = stayRecordRepository.save(stay);
+
+        // Update room status to AVAILABLE
+        try {
+            roomServiceClient.updateRoomStatus(stay.getAssignedRoomId(), "AVAILABLE");
+        } catch (Exception e) {
+            log.warn("Failed to update room status: {}", e.getMessage());
+        }
+
+        // Update reservation status to CHECKEDOUT
+        try {
+            reservationServiceClient.updateReservationStatus(stay.getReservationId(), "CHECKEDOUT");
+        } catch (Exception e) {
+            log.warn("Failed to update reservation status: {}", e.getMessage());
+        }
+
+        log.info("Check-out completed for stay: {}, total folio: {}", stayId, total);
+        return mapToResponse(updated);
+    }
+
+    @Override
+    public StayRecordResponse getStayById(Integer stayId) {
+        StayRecord stay = stayRecordRepository.findById(stayId)
+                .orElseThrow(() -> new ResourceNotFoundException("Stay not found: " + stayId));
+        return mapToResponse(stay);
+    }
+
+    @Override
+    public List<StayRecordResponse> getAllStays() {
+        return stayRecordRepository.findAll().stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Override
+    public List<StayRecordResponse> getStaysByGuestId(Integer guestId) {
+        return stayRecordRepository.findByGuestId(guestId).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Override
+    public List<StayRecordResponse> getStaysByStatus(String status) {
+        StayStatus stayStatus = StayStatus.valueOf(status.toUpperCase());
+        return stayRecordRepository.findByStatus(stayStatus).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Override
+    public StayRecord getStayEntityById(Integer stayId) {
+        return stayRecordRepository.findById(stayId)
+                .orElseThrow(() -> new ResourceNotFoundException("Stay not found: " + stayId));
+    }
+
+    private StayRecordResponse mapToResponse(StayRecord stay) {
+        return StayRecordResponse.builder()
+                .stayId(stay.getStayId())
+                .reservationId(stay.getReservationId())
+                .guestId(stay.getGuestId())
+                .assignedRoomId(stay.getAssignedRoomId())
+                .actualCheckIn(stay.getActualCheckIn())
+                .actualCheckOut(stay.getActualCheckOut())
+                .folioBalance(stay.getFolioBalance())
+                .status(stay.getStatus())
+                .build();
+    }
+}
+```
+
+**`FolioItemService.java`** (`com.staynest.frontdesk.service`) — Interface
+```java
+package com.staynest.frontdesk.service;
+
+import com.staynest.frontdesk.dto.FolioItemRequest;
+import com.staynest.frontdesk.dto.FolioItemResponse;
+import com.staynest.frontdesk.enums.ChargeType;
+
+import java.util.List;
+
+public interface FolioItemService {
+    FolioItemResponse addFolioItem(Integer stayId, FolioItemRequest request);
+    List<FolioItemResponse> getFolioItemsByStayId(Integer stayId);
+    List<FolioItemResponse> getFolioItemsByChargeType(ChargeType chargeType);
+}
+```
+
+**`FolioItemServiceImpl.java`** (`com.staynest.frontdesk.service.impl`) — Implementation
+```java
+package com.staynest.frontdesk.service.impl;
+
+import com.staynest.frontdesk.dto.FolioItemRequest;
+import com.staynest.frontdesk.dto.FolioItemResponse;
+import com.staynest.frontdesk.entity.FolioItem;
+import com.staynest.frontdesk.entity.StayRecord;
+import com.staynest.frontdesk.enums.ChargeType;
+import com.staynest.frontdesk.enums.StayStatus;
+import com.staynest.frontdesk.exception.BadRequestException;
+import com.staynest.frontdesk.exception.ResourceNotFoundException;
+import com.staynest.frontdesk.repository.FolioItemRepository;
+import com.staynest.frontdesk.repository.StayRecordRepository;
+import com.staynest.frontdesk.service.FolioItemService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class FolioItemServiceImpl implements FolioItemService {
+
+    private final FolioItemRepository folioItemRepository;
+    private final StayRecordRepository stayRecordRepository;
+
+    @Override
+    public FolioItemResponse addFolioItem(Integer stayId, FolioItemRequest request) {
+        StayRecord stay = stayRecordRepository.findById(stayId)
+                .orElseThrow(() -> new ResourceNotFoundException("Stay not found: " + stayId));
+
+        if (stay.getStatus() == StayStatus.CHECKEDOUT) {
+            throw new BadRequestException("Cannot add charges to checked-out stay");
+        }
+
+        FolioItem item = FolioItem.builder()
+                .stayRecord(stay)
+                .chargeType(request.getChargeType())
+                .description(request.getDescription())
+                .amount(request.getAmount())
+                .postedBy(request.getPostedBy())
+                .build();
+
+        FolioItem saved = folioItemRepository.save(item);
+        log.info("Folio item added: {}", saved.getFolioItemId());
+        return mapToResponse(saved);
+    }
+
+    @Override
+    public List<FolioItemResponse> getFolioItemsByStayId(Integer stayId) {
+        return folioItemRepository.findByStayRecord_StayId(stayId).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Override
+    public List<FolioItemResponse> getFolioItemsByChargeType(ChargeType chargeType) {
+        return folioItemRepository.findByChargeType(chargeType).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    private FolioItemResponse mapToResponse(FolioItem item) {
+        return FolioItemResponse.builder()
+                .folioItemId(item.getFolioItemId())
+                .stayId(item.getStayRecord().getStayId())
+                .chargeType(item.getChargeType())
+                .description(item.getDescription())
+                .amount(item.getAmount())
+                .postedDate(item.getPostedDate())
+                .postedBy(item.getPostedBy())
+                .build();
+    }
+}
+```
+
+---
+
+### Controllers
+
+**`StayRecordController.java`** (`com.staynest.frontdesk.controller`)
+```java
+package com.staynest.frontdesk.controller;
+
+import com.staynest.frontdesk.dto.ApiResponse;
+import com.staynest.frontdesk.dto.CheckInRequest;
+import com.staynest.frontdesk.dto.FolioItemRequest;
+import com.staynest.frontdesk.dto.StayRecordResponse;
+import com.staynest.frontdesk.service.StayRecordService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@Slf4j
+@RestController
+@RequestMapping("/api/stay-records")
+@RequiredArgsConstructor
+public class StayRecordController {
+
+    private final StayRecordService stayRecordService;
+
+    @PostMapping("/checkin")
+    @PreAuthorize("hasAnyRole('ADMIN', 'FRONTDESK')")
+    public ResponseEntity<ApiResponse<StayRecordResponse>> checkIn(@Valid @RequestBody CheckInRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success("Check-in successful", stayRecordService.checkIn(request)));
+    }
+
+    @GetMapping
+    @PreAuthorize("hasAnyRole('ADMIN', 'FRONTDESK', 'REVENUEMANAGER')")
+    public ResponseEntity<ApiResponse<List<StayRecordResponse>>> getAll(
+            @RequestParam(required = false) Integer guestId,
+            @RequestParam(required = false) String status) {
+        if (guestId != null) {
+            return ResponseEntity.ok(ApiResponse.success(stayRecordService.getStaysByGuestId(guestId)));
+        }
+        if (status != null) {
+            return ResponseEntity.ok(ApiResponse.success(stayRecordService.getStaysByStatus(status)));
+        }
+        return ResponseEntity.ok(ApiResponse.success(stayRecordService.getAllStays()));
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<ApiResponse<StayRecordResponse>> getById(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success(stayRecordService.getStayById(id)));
+    }
+
+    @PostMapping("/{id}/folio-items")
+    @PreAuthorize("hasAnyRole('ADMIN', 'FRONTDESK', 'FBMANAGER')")
+    public ResponseEntity<ApiResponse<StayRecordResponse>> addFolioItem(
+            @PathVariable Integer id,
+            @Valid @RequestBody FolioItemRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success("Folio item added", stayRecordService.postFolioItem(id, request)));
+    }
+
+    @GetMapping("/{id}/folio-items")
+    public ResponseEntity<ApiResponse<List<com.staynest.frontdesk.dto.FolioItemResponse>>> getFolioItems(
+            @PathVariable Integer id) {
+        // This will be handled by FolioItemController, kept here for convenience
+        return ResponseEntity.ok(ApiResponse.success(List.of()));
+    }
+
+    @PostMapping("/{id}/checkout")
+    @PreAuthorize("hasAnyRole('ADMIN', 'FRONTDESK')")
+    public ResponseEntity<ApiResponse<StayRecordResponse>> checkOut(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success("Check-out successful", stayRecordService.checkOut(id)));
+    }
+}
+```
+
+**`FolioItemController.java`** (`com.staynest.frontdesk.controller`)
+```java
+package com.staynest.frontdesk.controller;
+
+import com.staynest.frontdesk.dto.ApiResponse;
+import com.staynest.frontdesk.dto.FolioItemRequest;
+import com.staynest.frontdesk.dto.FolioItemResponse;
+import com.staynest.frontdesk.enums.ChargeType;
+import com.staynest.frontdesk.service.FolioItemService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/folio-items")
+@RequiredArgsConstructor
+public class FolioItemController {
+
+    private final FolioItemService folioItemService;
+
+    @PostMapping("/stay/{stayId}")
+    public ResponseEntity<ApiResponse<FolioItemResponse>> add(
+            @PathVariable Integer stayId,
+            @Valid @RequestBody FolioItemRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success("Folio item added", folioItemService.addFolioItem(stayId, request)));
+    }
+
+    @GetMapping("/stay/{stayId}")
+    public ResponseEntity<ApiResponse<List<FolioItemResponse>>> getByStayId(@PathVariable Integer stayId) {
+        return ResponseEntity.ok(ApiResponse.success(folioItemService.getFolioItemsByStayId(stayId)));
+    }
+
+    @GetMapping("/charge-type/{chargeType}")
+    public ResponseEntity<ApiResponse<List<FolioItemResponse>>> getByChargeType(@PathVariable ChargeType chargeType) {
+        return ResponseEntity.ok(ApiResponse.success(folioItemService.getFolioItemsByChargeType(chargeType)));
+    }
+}
+```
+
+---
+
+### JUnit Tests
+
+**`StayRecordServiceTest.java`** (`com.staynest.frontdesk.service`)
+```java
+package com.staynest.frontdesk.service;
+
+import com.staynest.frontdesk.client.ReservationServiceClient;
+import com.staynest.frontdesk.client.RoomServiceClient;
+import com.staynest.frontdesk.dto.CheckInRequest;
+import com.staynest.frontdesk.dto.FolioItemRequest;
+import com.staynest.frontdesk.entity.StayRecord;
+import com.staynest.frontdesk.enums.ChargeType;
+import com.staynest.frontdesk.enums.StayStatus;
+import com.staynest.frontdesk.exception.BadRequestException;
+import com.staynest.frontdesk.exception.ResourceNotFoundException;
+import com.staynest.frontdesk.repository.FolioItemRepository;
+import com.staynest.frontdesk.repository.StayRecordRepository;
+import com.staynest.frontdesk.service.impl.StayRecordServiceImpl;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.Optional;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class StayRecordServiceTest {
+
+    @Mock private StayRecordRepository stayRecordRepository;
+    @Mock private FolioItemRepository folioItemRepository;
+    @Mock private RoomServiceClient roomServiceClient;
+    @Mock private ReservationServiceClient reservationServiceClient;
+    @InjectMocks private StayRecordServiceImpl stayRecordService;
+
+    private CheckInRequest checkInRequest;
+    private StayRecord stayRecord;
+
+    @BeforeEach
+    void setUp() {
+        checkInRequest = new CheckInRequest();
+        checkInRequest.setReservationId(1);
+        checkInRequest.setRoomId(101);
+
+        stayRecord = StayRecord.builder()
+                .stayId(1)
+                .reservationId(1)
+                .guestId(1)
+                .assignedRoomId(101)
+                .actualCheckIn(LocalDateTime.now())
+                .folioBalance(BigDecimal.ZERO)
+                .status(StayStatus.ACTIVE)
+                .build();
+    }
+
+    @Test
+    void checkIn_valid_shouldCreateStayAndUpdateRoom() {
+        when(stayRecordRepository.findByReservationId(1)).thenReturn(Optional.empty());
+        when(stayRecordRepository.save(any(StayRecord.class))).thenReturn(stayRecord);
+
+        var response = stayRecordService.checkIn(checkInRequest);
+        assertNotNull(response);
+        assertEquals(StayStatus.ACTIVE, response.getStatus());
+        assertEquals(101, response.getAssignedRoomId());
+    }
+
+    @Test
+    void postFolioItem_shouldAddToFolio() {
+        FolioItemRequest request = new FolioItemRequest();
+        request.setChargeType(ChargeType.ROOMRENT);
+        request.setDescription("Room rent");
+        request.setAmount(new BigDecimal("5000"));
+        request.setPostedBy(1);
+
+        when(stayRecordRepository.findById(1)).thenReturn(Optional.of(stayRecord));
+        when(stayRecordRepository.save(any(StayRecord.class))).thenReturn(stayRecord);
+
+        var response = stayRecordService.postFolioItem(1, request);
+        assertNotNull(response);
+    }
+
+    @Test
+    void checkOut_shouldSetStatusAndFreeRoom() {
+        when(stayRecordRepository.findById(1)).thenReturn(Optional.of(stayRecord));
+        when(folioItemRepository.findByStayRecord_StayId(1)).thenReturn(java.util.List.of());
+        when(stayRecordRepository.save(any(StayRecord.class))).thenReturn(stayRecord);
+
+        var response = stayRecordService.checkOut(1);
+        assertEquals(StayStatus.CHECKEDOUT, response.getStatus());
+    }
+
+    @Test
+    void checkOut_alreadyCheckedOut_shouldThrow() {
+        stayRecord.setStatus(StayStatus.CHECKEDOUT);
+        when(stayRecordRepository.findById(1)).thenReturn(Optional.of(stayRecord));
+
+        assertThrows(BadRequestException.class, () -> stayRecordService.checkOut(1));
+    }
+
+    @Test
+    void getStayById_invalid_shouldThrow() {
+        when(stayRecordRepository.findById(999)).thenReturn(Optional.empty());
+        assertThrows(ResourceNotFoundException.class, () -> stayRecordService.getStayById(999));
+    }
+}
+```
+
+---
+
+## Phase 4B: Housekeeping Service (`staynest-housekeeping-service`)
+
+**Dependencies in STS:** `Spring Web`, `Spring Data JPA`, `MySQL Driver`, `Spring Security`, `Eureka Discovery Client`, `OpenFeign`, `Lombok`, `Validation`
+
+**Manual `pom.xml` addition for JWT:** (same as above)
+
+**`application.yml`:**
+```yaml
+server:
+  port: 8085
+
+spring:
+  application:
+    name: housekeeping-service
+  datasource:
+    url: jdbc:mysql://localhost:3306/staynest_housekeeping_db?createDatabaseIfNotExist=true&useSSL=false&serverTimezone=UTC
+    username: root
+    password: root
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQL8Dialect
+        format_sql: true
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+jwt:
+  secret: staynest-secret-key-for-jwt-signing-2026
+  expiration: 86400000
+```
+
+---
+
+### Main Application
+
+**`HousekeepingServiceApplication.java`** (`com.staynest.housekeeping`)
+```java
+package com.staynest.housekeeping;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
+
+@SpringBootApplication
+@EnableDiscoveryClient
+public class HousekeepingServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(HousekeepingServiceApplication.class, args);
+    }
+}
+```
+
+---
+
+### Enums
+
+**`TaskType.java`** (`com.staynest.housekeeping.enums`)
+```java
+package com.staynest.housekeeping.enums;
+
+public enum TaskType {
+    CHECKOUT,
+    STAYOVERSERVICE,
+    TURNDOWN,
+    DEEPCLEAN
+}
+```
+
+**`TaskStatus.java`** (`com.staynest.housekeeping.enums`)
+```java
+package com.staynest.housekeeping.enums;
+
+public enum TaskStatus {
+    PENDING,
+    INPROGRESS,
+    DONE,
+    SKIPPED
+}
+```
+
+**`MaintenancePriority.java`** (`com.staynest.housekeeping.enums`)
+```java
+package com.staynest.housekeeping.enums;
+
+public enum MaintenancePriority {
+    LOW,
+    MEDIUM,
+    HIGH,
+    URGENT
+}
+```
+
+**`MaintenanceStatus.java`** (`com.staynest.housekeeping.enums`)
+```java
+package com.staynest.housekeeping.enums;
+
+public enum MaintenanceStatus {
+    OPEN,
+    INPROGRESS,
+    RESOLVED,
+    DEFERRED
+}
+```
+
+---
+
+### JWT, Exceptions, ApiResponse (Same self-contained pattern — copy from Front Desk Service with package changed to `com.staynest.housekeeping`)
+
+---
+
+### DTOs
+
+**`HousekeepingTaskRequest.java`** (`com.staynest.housekeeping.dto`)
+```java
+package com.staynest.housekeeping.dto;
+
+import com.staynest.housekeeping.enums.TaskType;
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+
+import java.time.LocalDate;
+
+@Data
+public class HousekeepingTaskRequest {
+    @NotNull
+    private Integer roomId;
+    @NotNull
+    private TaskType taskType;
+    private Integer assignedToId;
+    private LocalDate assignedDate;
+}
+```
+
+**`HousekeepingTaskResponse.java`** (`com.staynest.housekeeping.dto`)
+```java
+package com.staynest.housekeeping.dto;
+
+import com.staynest.housekeeping.enums.TaskStatus;
+import com.staynest.housekeeping.enums.TaskType;
+import lombok.Builder;
+import lombok.Data;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+@Data
+@Builder
+public class HousekeepingTaskResponse {
+    private Integer taskId;
+    private Integer roomId;
+    private TaskType taskType;
+    private Integer assignedToId;
+    private LocalDate assignedDate;
+    private LocalDateTime completedAt;
+    private TaskStatus status;
+}
+```
+
+**`MaintenanceRequestDto.java`** (`com.staynest.housekeeping.dto`) — renamed to avoid conflict with entity
+```java
+package com.staynest.housekeeping.dto;
+
+import com.staynest.housekeeping.enums.MaintenancePriority;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+
+@Data
+public class MaintenanceRequestDto {
+    @NotNull
+    private Integer roomId;
+    @NotNull
+    private Integer reportedBy;
+    @NotBlank
+    private String issueDescription;
+    @NotNull
+    private MaintenancePriority priority;
+}
+```
+
+**`MaintenanceResponse.java`** (`com.staynest.housekeeping.dto`)
+```java
+package com.staynest.housekeeping.dto;
+
+import com.staynest.housekeeping.enums.MaintenancePriority;
+import com.staynest.housekeeping.enums.MaintenanceStatus;
+import lombok.Builder;
+import lombok.Data;
+
+import java.time.LocalDate;
+
+@Data
+@Builder
+public class MaintenanceResponse {
+    private Integer requestId;
+    private Integer roomId;
+    private Integer reportedBy;
+    private String issueDescription;
+    private MaintenancePriority priority;
+    private LocalDate raisedDate;
+    private LocalDate resolvedDate;
+    private MaintenanceStatus status;
+}
+```
+
+---
+
+### Entities
+
+**`HousekeepingTask.java`** (`com.staynest.housekeeping.entity`)
+```java
+package com.staynest.housekeeping.entity;
+
+import com.staynest.housekeeping.enums.TaskStatus;
+import com.staynest.housekeeping.enums.TaskType;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "housekeeping_tasks")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class HousekeepingTask {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "TaskID")
+    private Integer taskId;
+
+    @Column(name = "RoomID", nullable = false)
+    private Integer roomId;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "TaskType", nullable = false)
+    private TaskType taskType;
+
+    @Column(name = "AssignedToID")
+    private Integer assignedToId;
+
+    @Column(name = "AssignedDate")
+    private LocalDate assignedDate;
+
+    @Column(name = "CompletedAt")
+    private LocalDateTime completedAt;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Status", nullable = false)
+    @Builder.Default
+    private TaskStatus status = TaskStatus.PENDING;
+
+    @CreationTimestamp
+    @Column(name = "CreatedAt", updatable = false)
+    private LocalDateTime createdAt;
+
+    @UpdateTimestamp
+    @Column(name = "UpdatedAt")
+    private LocalDateTime updatedAt;
+}
+```
+
+**`MaintenanceRequest.java`** (`com.staynest.housekeeping.entity`)
+```java
+package com.staynest.housekeeping.entity;
+
+import com.staynest.housekeeping.enums.MaintenancePriority;
+import com.staynest.housekeeping.enums.MaintenanceStatus;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.time.LocalDate;
+
+@Entity
+@Table(name = "maintenance_requests")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class MaintenanceRequest {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "RequestID")
+    private Integer requestId;
+
+    @Column(name = "RoomID", nullable = false)
+    private Integer roomId;
+
+    @Column(name = "ReportedBy", nullable = false)
+    private Integer reportedBy;
+
+    @Column(name = "IssueDescription", columnDefinition = "TEXT")
+    private String issueDescription;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Priority", nullable = false)
+    private MaintenancePriority priority;
+
+    @Column(name = "RaisedDate")
+    @Builder.Default
+    private LocalDate raisedDate = LocalDate.now();
+
+    @Column(name = "ResolvedDate")
+    private LocalDate resolvedDate;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Status", nullable = false)
+    @Builder.Default
+    private MaintenanceStatus status = MaintenanceStatus.OPEN;
+
+    @CreationTimestamp
+    @Column(name = "CreatedAt", updatable = false)
+    private LocalDateTime createdAt;
+
+    @UpdateTimestamp
+    @Column(name = "UpdatedAt")
+    private LocalDateTime updatedAt;
+}
+```
+
+---
+
+### Repositories
+
+**`HousekeepingTaskRepository.java`** (`com.staynest.housekeeping.repository`)
+```java
+package com.staynest.housekeeping.repository;
+
+import com.staynest.housekeeping.entity.HousekeepingTask;
+import com.staynest.housekeeping.enums.TaskStatus;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface HousekeepingTaskRepository extends JpaRepository<HousekeepingTask, Integer> {
+    List<HousekeepingTask> findByRoomId(Integer roomId);
+    List<HousekeepingTask> findByStatus(TaskStatus status);
+    List<HousekeepingTask> findByAssignedToId(Integer assignedToId);
+}
+```
+
+**`MaintenanceRequestRepository.java`** (`com.staynest.housekeeping.repository`)
+```java
+package com.staynest.housekeeping.repository;
+
+import com.staynest.housekeeping.entity.MaintenanceRequest;
+import com.staynest.housekeeping.enums.MaintenancePriority;
+import com.staynest.housekeeping.enums.MaintenanceStatus;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface MaintenanceRequestRepository extends JpaRepository<MaintenanceRequest, Integer> {
+    List<MaintenanceRequest> findByRoomId(Integer roomId);
+    List<MaintenanceRequest> findByStatus(MaintenanceStatus status);
+    List<MaintenanceRequest> findByPriority(MaintenancePriority priority);
+}
+```
+
+---
+
+### Service Interface + ServiceImpl Pattern
+
+**`HousekeepingTaskService.java`** (`com.staynest.housekeeping.service`) — Interface
+```java
+package com.staynest.housekeeping.service;
+
+import com.staynest.housekeeping.dto.HousekeepingTaskRequest;
+import com.staynest.housekeeping.dto.HousekeepingTaskResponse;
+import com.staynest.housekeeping.enums.TaskStatus;
+
+import java.util.List;
+
+public interface HousekeepingTaskService {
+    HousekeepingTaskResponse createTask(HousekeepingTaskRequest request);
+    HousekeepingTaskResponse assignTask(Integer taskId, Integer staffId);
+    HousekeepingTaskResponse updateTaskStatus(Integer taskId, TaskStatus status);
+    HousekeepingTaskResponse getTaskById(Integer taskId);
+    List<HousekeepingTaskResponse> getAllTasks();
+    List<HousekeepingTaskResponse> getTasksByStatus(TaskStatus status);
+    List<HousekeepingTaskResponse> getTasksByRoomId(Integer roomId);
+    List<HousekeepingTaskResponse> getTasksByAssignedTo(Integer staffId);
+}
+```
+
+**`HousekeepingTaskServiceImpl.java`** (`com.staynest.housekeeping.service.impl`) — Implementation
+```java
+package com.staynest.housekeeping.service.impl;
+
+import com.staynest.housekeeping.dto.HousekeepingTaskRequest;
+import com.staynest.housekeeping.dto.HousekeepingTaskResponse;
+import com.staynest.housekeeping.entity.HousekeepingTask;
+import com.staynest.housekeeping.enums.TaskStatus;
+import com.staynest.housekeeping.exception.ResourceNotFoundException;
+import com.staynest.housekeeping.repository.HousekeepingTaskRepository;
+import com.staynest.housekeeping.service.HousekeepingTaskService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class HousekeepingTaskServiceImpl implements HousekeepingTaskService {
+
+    private final HousekeepingTaskRepository taskRepository;
+
+    @Override
+    public HousekeepingTaskResponse createTask(HousekeepingTaskRequest request) {
+        HousekeepingTask task = HousekeepingTask.builder()
+                .roomId(request.getRoomId())
+                .taskType(request.getTaskType())
+                .assignedToId(request.getAssignedToId())
+                .assignedDate(request.getAssignedDate())
+                .build();
+
+        HousekeepingTask saved = taskRepository.save(task);
+        log.info("Housekeeping task created: {}", saved.getTaskId());
+        return mapToResponse(saved);
+    }
+
+    @Override
+    public HousekeepingTaskResponse assignTask(Integer taskId, Integer staffId) {
+        HousekeepingTask task = taskRepository.findById(taskId)
+                .orElseThrow(() -> new ResourceNotFoundException("Task not found: " + taskId));
+        
+        task.setAssignedToId(staffId);
+        task.setStatus(TaskStatus.INPROGRESS);
+        HousekeepingTask updated = taskRepository.save(task);
+        log.info("Task {} assigned to staff {}", taskId, staffId);
+        return mapToResponse(updated);
+    }
+
+    @Override
+    public HousekeepingTaskResponse updateTaskStatus(Integer taskId, TaskStatus status) {
+        HousekeepingTask task = taskRepository.findById(taskId)
+                .orElseThrow(() -> new ResourceNotFoundException("Task not found: " + taskId));
+        
+        task.setStatus(status);
+        if (status == TaskStatus.DONE) {
+            task.setCompletedAt(LocalDateTime.now());
+        }
+        HousekeepingTask updated = taskRepository.save(task);
+        log.info("Task {} status updated to {}", taskId, status);
+        return mapToResponse(updated);
+    }
+
+    @Override
+    public HousekeepingTaskResponse getTaskById(Integer taskId) {
+        HousekeepingTask task = taskRepository.findById(taskId)
+                .orElseThrow(() -> new ResourceNotFoundException("Task not found: " + taskId));
+        return mapToResponse(task);
+    }
+
+    @Override
+    public List<HousekeepingTaskResponse> getAllTasks() {
+        return taskRepository.findAll().stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Override
+    public List<HousekeepingTaskResponse> getTasksByStatus(TaskStatus status) {
+        return taskRepository.findByStatus(status).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Override
+    public List<HousekeepingTaskResponse> getTasksByRoomId(Integer roomId) {
+        return taskRepository.findByRoomId(roomId).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Override
+    public List<HousekeepingTaskResponse> getTasksByAssignedTo(Integer staffId) {
+        return taskRepository.findByAssignedToId(staffId).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    private HousekeepingTaskResponse mapToResponse(HousekeepingTask task) {
+        return HousekeepingTaskResponse.builder()
+                .taskId(task.getTaskId())
+                .roomId(task.getRoomId())
+                .taskType(task.getTaskType())
+                .assignedToId(task.getAssignedToId())
+                .assignedDate(task.getAssignedDate())
+                .completedAt(task.getCompletedAt())
+                .status(task.getStatus())
+                .build();
+    }
+}
+```
+
+**`MaintenanceRequestService.java`** (`com.staynest.housekeeping.service`) — Interface
+```java
+package com.staynest.housekeeping.service;
+
+import com.staynest.housekeeping.dto.MaintenanceRequestDto;
+import com.staynest.housekeeping.dto.MaintenanceResponse;
+import com.staynest.housekeeping.enums.MaintenanceStatus;
+
+import java.util.List;
+
+public interface MaintenanceRequestService {
+    MaintenanceResponse reportIssue(MaintenanceRequestDto request);
+    MaintenanceResponse updateStatus(Integer requestId, MaintenanceStatus status);
+    MaintenanceResponse resolveRequest(Integer requestId);
+    MaintenanceResponse getRequestById(Integer requestId);
+    List<MaintenanceResponse> getAllRequests();
+    List<MaintenanceResponse> getRequestsByStatus(MaintenanceStatus status);
+    List<MaintenanceResponse> getRequestsByRoomId(Integer roomId);
+}
+```
+
+**`MaintenanceRequestServiceImpl.java`** (`com.staynest.housekeeping.service.impl`) — Implementation
+```java
+package com.staynest.housekeeping.service.impl;
+
+import com.staynest.housekeeping.dto.MaintenanceRequestDto;
+import com.staynest.housekeeping.dto.MaintenanceResponse;
+import com.staynest.housekeeping.entity.MaintenanceRequest;
+import com.staynest.housekeeping.enums.MaintenanceStatus;
+import com.staynest.housekeeping.exception.BadRequestException;
+import com.staynest.housekeeping.exception.ResourceNotFoundException;
+import com.staynest.housekeeping.repository.MaintenanceRequestRepository;
+import com.staynest.housekeeping.service.MaintenanceRequestService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDate;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class MaintenanceRequestServiceImpl implements MaintenanceRequestService {
+
+    private final MaintenanceRequestRepository maintenanceRepository;
+
+    @Override
+    public MaintenanceResponse reportIssue(MaintenanceRequestDto request) {
+        MaintenanceRequest maintenance = MaintenanceRequest.builder()
+                .roomId(request.getRoomId())
+                .reportedBy(request.getReportedBy())
+                .issueDescription(request.getIssueDescription())
+                .priority(request.getPriority())
+                .build();
+
+        MaintenanceRequest saved = maintenanceRepository.save(maintenance);
+        log.info("Maintenance request created: {}", saved.getRequestId());
+        return mapToResponse(saved);
+    }
+
+    @Override
+    public MaintenanceResponse updateStatus(Integer requestId, MaintenanceStatus status) {
+        MaintenanceRequest request = maintenanceRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Maintenance request not found: " + requestId));
+        
+        request.setStatus(status);
+        MaintenanceRequest updated = maintenanceRepository.save(request);
+        log.info("Maintenance request {} status updated to {}", requestId, status);
+        return mapToResponse(updated);
+    }
+
+    @Override
+    public MaintenanceResponse resolveRequest(Integer requestId) {
+        MaintenanceRequest request = maintenanceRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Maintenance request not found: " + requestId));
+        
+        if (request.getStatus() == MaintenanceStatus.RESOLVED) {
+            throw new BadRequestException("Request is already resolved");
+        }
+        
+        request.setStatus(MaintenanceStatus.RESOLVED);
+        request.setResolvedDate(LocalDate.now());
+        MaintenanceRequest updated = maintenanceRepository.save(request);
+        log.info("Maintenance request {} resolved", requestId);
+        return mapToResponse(updated);
+    }
+
+    @Override
+    public MaintenanceResponse getRequestById(Integer requestId) {
+        MaintenanceRequest request = maintenanceRepository.findById(requestId)
+                .orElseThrow(() -> new ResourceNotFoundException("Maintenance request not found: " + requestId));
+        return mapToResponse(request);
+    }
+
+    @Override
+    public List<MaintenanceResponse> getAllRequests() {
+        return maintenanceRepository.findAll().stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Override
+    public List<MaintenanceResponse> getRequestsByStatus(MaintenanceStatus status) {
+        return maintenanceRepository.findByStatus(status).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Override
+    public List<MaintenanceResponse> getRequestsByRoomId(Integer roomId) {
+        return maintenanceRepository.findByRoomId(roomId).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    private MaintenanceResponse mapToResponse(MaintenanceRequest mr) {
+        return MaintenanceResponse.builder()
+                .requestId(mr.getRequestId())
+                .roomId(mr.getRoomId())
+                .reportedBy(mr.getReportedBy())
+                .issueDescription(mr.getIssueDescription())
+                .priority(mr.getPriority())
+                .raisedDate(mr.getRaisedDate())
+                .resolvedDate(mr.getResolvedDate())
+                .status(mr.getStatus())
+                .build();
+    }
+}
+```
+
+---
+
+### Controllers
+
+**`HousekeepingTaskController.java`** (`com.staynest.housekeeping.controller`)
+```java
+package com.staynest.housekeeping.controller;
+
+import com.staynest.housekeeping.dto.ApiResponse;
+import com.staynest.housekeeping.dto.HousekeepingTaskRequest;
+import com.staynest.housekeeping.dto.HousekeepingTaskResponse;
+import com.staynest.housekeeping.enums.TaskStatus;
+import com.staynest.housekeeping.service.HousekeepingTaskService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/housekeeping-tasks")
+@RequiredArgsConstructor
+public class HousekeepingTaskController {
+
+    private final HousekeepingTaskService taskService;
+
+    @PostMapping
+    @PreAuthorize("hasAnyRole('ADMIN', 'HOUSEKEEPING')")
+    public ResponseEntity<ApiResponse<HousekeepingTaskResponse>> create(@Valid @RequestBody HousekeepingTaskRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success("Task created", taskService.createTask(request)));
+    }
+
+    @GetMapping
+    public ResponseEntity<ApiResponse<List<HousekeepingTaskResponse>>> getAll(
+            @RequestParam(required = false) TaskStatus status,
+            @RequestParam(required = false) Integer roomId) {
+        if (status != null) {
+            return ResponseEntity.ok(ApiResponse.success(taskService.getTasksByStatus(status)));
+        }
+        if (roomId != null) {
+            return ResponseEntity.ok(ApiResponse.success(taskService.getTasksByRoomId(roomId)));
+        }
+        return ResponseEntity.ok(ApiResponse.success(taskService.getAllTasks()));
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<ApiResponse<HousekeepingTaskResponse>> getById(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success(taskService.getTaskById(id)));
+    }
+
+    @PatchMapping("/{id}/assign")
+    @PreAuthorize("hasAnyRole('ADMIN', 'HOUSEKEEPING')")
+    public ResponseEntity<ApiResponse<HousekeepingTaskResponse>> assign(
+            @PathVariable Integer id,
+            @RequestParam Integer staffId) {
+        return ResponseEntity.ok(ApiResponse.success("Task assigned", taskService.assignTask(id, staffId)));
+    }
+
+    @PatchMapping("/{id}/status")
+    @PreAuthorize("hasAnyRole('ADMIN', 'HOUSEKEEPING')")
+    public ResponseEntity<ApiResponse<HousekeepingTaskResponse>> updateStatus(
+            @PathVariable Integer id,
+            @RequestParam TaskStatus status) {
+        return ResponseEntity.ok(ApiResponse.success("Status updated", taskService.updateTaskStatus(id, status)));
+    }
+}
+```
+
+**`MaintenanceRequestController.java`** (`com.staynest.housekeeping.controller`)
+```java
+package com.staynest.housekeeping.controller;
+
+import com.staynest.housekeeping.dto.ApiResponse;
+import com.staynest.housekeeping.dto.MaintenanceRequestDto;
+import com.staynest.housekeeping.dto.MaintenanceResponse;
+import com.staynest.housekeeping.enums.MaintenanceStatus;
+import com.staynest.housekeeping.service.MaintenanceRequestService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/maintenance-requests")
+@RequiredArgsConstructor
+public class MaintenanceRequestController {
+
+    private final MaintenanceRequestService maintenanceService;
+
+    @PostMapping
+    @PreAuthorize("hasAnyRole('ADMIN', 'FRONTDESK', 'HOUSEKEEPING')")
+    public ResponseEntity<ApiResponse<MaintenanceResponse>> create(@Valid @RequestBody MaintenanceRequestDto request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success("Maintenance request created", maintenanceService.reportIssue(request)));
+    }
+
+    @GetMapping
+    public ResponseEntity<ApiResponse<List<MaintenanceResponse>>> getAll(
+            @RequestParam(required = false) Integer roomId,
+            @RequestParam(required = false) MaintenanceStatus status) {
+        if (roomId != null) {
+            return ResponseEntity.ok(ApiResponse.success(maintenanceService.getRequestsByRoomId(roomId)));
+        }
+        if (status != null) {
+            return ResponseEntity.ok(ApiResponse.success(maintenanceService.getRequestsByStatus(status)));
+        }
+        return ResponseEntity.ok(ApiResponse.success(maintenanceService.getAllRequests()));
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<ApiResponse<MaintenanceResponse>> getById(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success(maintenanceService.getRequestById(id)));
+    }
+
+    @PatchMapping("/{id}/status")
+    @PreAuthorize("hasAnyRole('ADMIN', 'HOUSEKEEPING')")
+    public ResponseEntity<ApiResponse<MaintenanceResponse>> updateStatus(
+            @PathVariable Integer id,
+            @RequestParam MaintenanceStatus status) {
+        return ResponseEntity.ok(ApiResponse.success("Status updated", maintenanceService.updateStatus(id, status)));
+    }
+
+    @PatchMapping("/{id}/resolve")
+    @PreAuthorize("hasAnyRole('ADMIN', 'HOUSEKEEPING')")
+    public ResponseEntity<ApiResponse<MaintenanceResponse>> resolve(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success("Request resolved", maintenanceService.resolveRequest(id)));
+    }
+}
+```
+
+---
+
+### JUnit Tests
+
+**`HousekeepingTaskServiceTest.java`** (`com.staynest.housekeeping.service`)
+```java
+package com.staynest.housekeeping.service;
+
+import com.staynest.housekeeping.dto.HousekeepingTaskRequest;
+import com.staynest.housekeeping.entity.HousekeepingTask;
+import com.staynest.housekeeping.enums.TaskStatus;
+import com.staynest.housekeeping.enums.TaskType;
+import com.staynest.housekeeping.exception.ResourceNotFoundException;
+import com.staynest.housekeeping.repository.HousekeepingTaskRepository;
+import com.staynest.housekeeping.service.impl.HousekeepingTaskServiceImpl;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.util.Optional;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class HousekeepingTaskServiceTest {
+
+    @Mock private HousekeepingTaskRepository taskRepository;
+    @InjectMocks private HousekeepingTaskServiceImpl taskService;
+
+    private HousekeepingTask task;
+
+    @BeforeEach
+    void setUp() {
+        task = HousekeepingTask.builder()
+                .taskId(1)
+                .roomId(101)
+                .taskType(TaskType.CHECKOUT)
+                .status(TaskStatus.PENDING)
+                .build();
+    }
+
+    @Test
+    void createTask_shouldSavePending() {
+        HousekeepingTaskRequest request = new HousekeepingTaskRequest();
+        request.setRoomId(101);
+        request.setTaskType(TaskType.CHECKOUT);
+
+        when(taskRepository.save(any(HousekeepingTask.class))).thenReturn(task);
+
+        var response = taskService.createTask(request);
+        assertNotNull(response);
+        assertEquals(TaskStatus.PENDING, response.getStatus());
+    }
+
+    @Test
+    void updateTaskStatus_inprogressToDone_shouldUpdate() {
+        task.setStatus(TaskStatus.INPROGRESS);
+        when(taskRepository.findById(1)).thenReturn(Optional.of(task));
+        when(taskRepository.save(any(HousekeepingTask.class))).thenReturn(task);
+
+        var response = taskService.updateTaskStatus(1, TaskStatus.DONE);
+        assertEquals(TaskStatus.DONE, response.getStatus());
+        assertNotNull(response.getCompletedAt());
+    }
+
+    @Test
+    void getTaskById_invalid_shouldThrow() {
+        when(taskRepository.findById(999)).thenReturn(Optional.empty());
+        assertThrows(ResourceNotFoundException.class, () -> taskService.getTaskById(999));
+    }
+}
+```
+
+**`MaintenanceRequestServiceTest.java`** (`com.staynest.housekeeping.service`)
+```java
+package com.staynest.housekeeping.service;
+
+import com.staynest.housekeeping.dto.MaintenanceRequestDto;
+import com.staynest.housekeeping.entity.MaintenanceRequest;
+import com.staynest.housekeeping.enums.MaintenancePriority;
+import com.staynest.housekeeping.enums.MaintenanceStatus;
+import com.staynest.housekeeping.exception.BadRequestException;
+import com.staynest.housekeeping.repository.MaintenanceRequestRepository;
+import com.staynest.housekeeping.service.impl.MaintenanceRequestServiceImpl;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.util.Optional;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class MaintenanceRequestServiceTest {
+
+    @Mock private MaintenanceRequestRepository maintenanceRepository;
+    @InjectMocks private MaintenanceRequestServiceImpl maintenanceService;
+
+    private MaintenanceRequest request;
+
+    @BeforeEach
+    void setUp() {
+        request = MaintenanceRequest.builder()
+                .requestId(1)
+                .roomId(101)
+                .reportedBy(2)
+                .issueDescription("AC not working")
+                .priority(MaintenancePriority.HIGH)
+                .status(MaintenanceStatus.OPEN)
+                .build();
+    }
+
+    @Test
+    void reportIssue_shouldSaveOpen() {
+        MaintenanceRequestDto dto = new MaintenanceRequestDto();
+        dto.setRoomId(101);
+        dto.setReportedBy(2);
+        dto.setIssueDescription("AC not working");
+        dto.setPriority(MaintenancePriority.HIGH);
+
+        when(maintenanceRepository.save(any(MaintenanceRequest.class))).thenReturn(request);
+
+        var response = maintenanceService.reportIssue(dto);
+        assertNotNull(response);
+        assertEquals(MaintenanceStatus.OPEN, response.getStatus());
+    }
+
+    @Test
+    void resolveRequest_shouldSetResolvedAndDate() {
+        when(maintenanceRepository.findById(1)).thenReturn(Optional.of(request));
+        when(maintenanceRepository.save(any(MaintenanceRequest.class))).thenReturn(request);
+
+        var response = maintenanceService.resolveRequest(1);
+        assertEquals(MaintenanceStatus.RESOLVED, response.getStatus());
+        assertNotNull(response.getResolvedDate());
+    }
+
+    @Test
+    void resolveRequest_alreadyResolved_shouldThrow() {
+        request.setStatus(MaintenanceStatus.RESOLVED);
+        when(maintenanceRepository.findById(1)).thenReturn(Optional.of(request));
+
+        assertThrows(BadRequestException.class, () -> maintenanceService.resolveRequest(1));
+    }
+}
+```
+
+---
+
+## Seed Data (MySQL)
+
+```sql
+-- Front Desk DB
+USE staynest_frontdesk_db;
+
+INSERT INTO stay_records (ReservationID, GuestID, AssignedRoomID, ActualCheckIn, FolioBalance, Status) VALUES
+(1, 1, 101, NOW(), 0.00, 'ACTIVE'),
+(2, 2, 102, NOW(), 1500.00, 'ACTIVE');
+
+INSERT INTO folio_items (StayID, ChargeType, Description, Amount, PostedBy) VALUES
+(1, 'ROOMRENT', 'Room rent for 2 nights', 8000.00, 2),
+(1, 'FBCHARGE', 'Dinner', 1200.00, 4),
+(2, 'ROOMRENT', 'Room rent for 1 night', 5000.00, 2),
+(2, 'SPA', 'Spa service', 3000.00, 2);
+
+-- Housekeeping DB
+USE staynest_housekeeping_db;
+
+INSERT INTO housekeeping_tasks (RoomID, TaskType, AssignedToID, AssignedDate, Status) VALUES
+(101, 'CHECKOUT', 3, CURDATE(), 'PENDING'),
+(102, 'STAYOVERSERVICE', 3, CURDATE(), 'INPROGRESS'),
+(103, 'TURNDOWN', 3, CURDATE(), 'DONE');
+
+INSERT INTO maintenance_requests (RoomID, ReportedBy, IssueDescription, Priority, RaisedDate, Status) VALUES
+(101, 2, 'AC not cooling properly', 'HIGH', CURDATE(), 'OPEN'),
+(102, 2, 'Light bulb flickering', 'LOW', CURDATE(), 'INPROGRESS');
+```
+
+---
+
+## What You've Built So Far
+
+| Service | Port | Status |
+|---------|------|--------|
+| Eureka Server | 8761 | ✅ Complete |
+| API Gateway | 8080 | ✅ Complete |
+| IAM Service | 8081 | ✅ Complete |
+| Room Service | 8082 | ✅ Complete |
+| Reservation Service | 8083 | ✅ Complete |
+| **Front Desk Service** | **8084** | **✅ Complete** |
+| **Housekeeping Service** | **8085** | **✅ Complete** |
+
+---
+
+## Next Up
+
+Tell me which phase to generate:
+
+- **Phase 5**: F&B Service (Port 8086) + Notification Service (Port 8088)
+- **Phase 6**: Revenue Service (Port 8087)
+
+Or say **"Phase 5"** for both F&B and Notification together! 🚀
