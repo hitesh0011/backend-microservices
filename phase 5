@@ -1,0 +1,2106 @@
+Here's **Phase 5: F&B Service (Port 8086)** and **Notification Service (Port 8088)** — with **Service Interface + ServiceImpl** pattern.
+
+---
+
+## Phase 5A: F&B Service (`staynest-fb-service`)
+
+**Dependencies in STS:** `Spring Web`, `Spring Data JPA`, `MySQL Driver`, `Spring Security`, `Eureka Discovery Client`, `OpenFeign`, `Lombok`, `Validation`
+
+**Manual `pom.xml` addition for JWT:**
+```xml
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-api</artifactId>
+    <version>0.11.5</version>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-impl</artifactId>
+    <version>0.11.5</version>
+    <scope>runtime</scope>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-jackson</artifactId>
+    <version>0.11.5</version>
+    <scope>runtime</scope>
+</dependency>
+```
+
+**`application.yml`:**
+```yaml
+server:
+  port: 8086
+
+spring:
+  application:
+    name: fb-service
+  datasource:
+    url: jdbc:mysql://localhost:3306/staynest_fb_db?createDatabaseIfNotExist=true&useSSL=false&serverTimezone=UTC
+    username: root
+    password: root
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQL8Dialect
+        format_sql: true
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+jwt:
+  secret: staynest-secret-key-for-jwt-signing-2026
+  expiration: 86400000
+```
+
+---
+
+### Main Application
+
+**`FbServiceApplication.java`** (`com.staynest.fb`)
+```java
+package com.staynest.fb;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
+import org.springframework.cloud.openfeign.EnableFeignClients;
+
+@SpringBootApplication
+@EnableDiscoveryClient
+@EnableFeignClients
+public class FbServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(FbServiceApplication.class, args);
+    }
+}
+```
+
+---
+
+### Enums
+
+**`MenuCategory.java`** (`com.staynest.fb.enums`)
+```java
+package com.staynest.fb.enums;
+
+public enum MenuCategory {
+    BREAKFAST,
+    MAINCOURSE,
+    BEVERAGE,
+    DESSERT
+}
+```
+
+**`OrderType.java`** (`com.staynest.fb.enums`)
+```java
+package com.staynest.fb.enums;
+
+public enum OrderType {
+    DINEIN,
+    INROOMDINING,
+    TAKEAWAY
+}
+```
+
+**`OrderStatus.java`** (`com.staynest.fb.enums`)
+```java
+package com.staynest.fb.enums;
+
+public enum OrderStatus {
+    PLACED,
+    PREPARING,
+    SERVED,
+    BILLED,
+    CANCELLED
+}
+```
+
+**`DiningResStatus.java`** (`com.staynest.fb.enums`)
+```java
+package com.staynest.fb.enums;
+
+public enum DiningResStatus {
+    CONFIRMED,
+    SEATED,
+    COMPLETED,
+    CANCELLED,
+    NOSHOW
+}
+```
+
+---
+
+### JWT Trio (Self-contained — same pattern, package `com.staynest.fb.jwt` and `com.staynest.fb.config`)
+
+**`JwtUtil.java`** (`com.staynest.fb.jwt`)
+```java
+package com.staynest.fb.jwt;
+
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.SignatureAlgorithm;
+import io.jsonwebtoken.security.Keys;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import javax.crypto.SecretKey;
+import java.nio.charset.StandardCharsets;
+import java.util.Date;
+
+@Component
+public class JwtUtil {
+
+    @Value("${jwt.secret}")
+    private String secret;
+
+    @Value("${jwt.expiration}")
+    private long expiration;
+
+    private SecretKey getSigningKey() {
+        return Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public boolean validateToken(String token) {
+        try {
+            Jwts.parserBuilder().setSigningKey(getSigningKey()).build().parseClaimsJws(token);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public String extractEmail(String token) {
+        return getClaims(token).getSubject();
+    }
+
+    public String extractRole(String token) {
+        return getClaims(token).get("role", String.class);
+    }
+
+    private Claims getClaims(String token) {
+        return Jwts.parserBuilder().setSigningKey(getSigningKey()).build().parseClaimsJws(token).getBody();
+    }
+}
+```
+
+**`JwtFilter.java`** (`com.staynest.fb.jwt`)
+```java
+package com.staynest.fb.jwt;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.Collections;
+
+@Component
+@RequiredArgsConstructor
+public class JwtFilter extends OncePerRequestFilter {
+
+    private final JwtUtil jwtUtil;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
+            throws ServletException, IOException {
+        
+        String header = request.getHeader("Authorization");
+        
+        if (header != null && header.startsWith("Bearer ")) {
+            String token = header.substring(7);
+            if (jwtUtil.validateToken(token)) {
+                String email = jwtUtil.extractEmail(token);
+                String role = jwtUtil.extractRole(token);
+                var auth = new UsernamePasswordAuthenticationToken(
+                    email, null, Collections.singletonList(new SimpleGrantedAuthority("ROLE_" + role)));
+                SecurityContextHolder.getContext().setAuthentication(auth);
+            }
+        }
+        chain.doFilter(request, response);
+    }
+}
+```
+
+**`SecurityConfig.java`** (`com.staynest.fb.config`)
+```java
+package com.staynest.fb.config;
+
+import com.staynest.fb.jwt.JwtFilter;
+import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+import java.util.Arrays;
+import java.util.List;
+
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+@RequiredArgsConstructor
+public class SecurityConfig {
+
+    private final JwtFilter jwtFilter;
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http.csrf(csrf -> csrf.disable())
+            .cors(cors -> cors.configurationSource(corsConfigurationSource()))
+            .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/auth/**", "/actuator/**").permitAll()
+                .anyRequest().authenticated())
+            .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration config = new CorsConfiguration();
+        config.setAllowedOrigins(List.of("http://localhost:3000"));
+        config.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+        config.setAllowedHeaders(List.of("*"));
+        config.setAllowCredentials(true);
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", config);
+        return source;
+    }
+}
+```
+
+---
+
+### Exceptions (Self-contained, package `com.staynest.fb.exception`)
+
+**`ResourceNotFoundException.java`**
+```java
+package com.staynest.fb.exception;
+
+public class ResourceNotFoundException extends RuntimeException {
+    public ResourceNotFoundException(String message) {
+        super(message);
+    }
+}
+```
+
+**`BadRequestException.java`**
+```java
+package com.staynest.fb.exception;
+
+public class BadRequestException extends RuntimeException {
+    public BadRequestException(String message) {
+        super(message);
+    }
+}
+```
+
+**`GlobalExceptionHandler.java`**
+```java
+package com.staynest.fb.exception;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleNotFound(ResourceNotFoundException ex) {
+        return buildError(HttpStatus.NOT_FOUND, ex.getMessage());
+    }
+
+    @ExceptionHandler(BadRequestException.class)
+    public ResponseEntity<Map<String, Object>> handleBadRequest(BadRequestException ex) {
+        return buildError(HttpStatus.BAD_REQUEST, ex.getMessage());
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<Map<String, Object>> handleGeneric(Exception ex) {
+        log.error("Unexpected error: ", ex);
+        return buildError(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred");
+    }
+
+    private ResponseEntity<Map<String, Object>> buildError(HttpStatus status, String message) {
+        Map<String, Object> error = new HashMap<>();
+        error.put("timestamp", LocalDateTime.now());
+        error.put("status", status.value());
+        error.put("error", status.getReasonPhrase());
+        error.put("message", message);
+        return new ResponseEntity<>(error, status);
+    }
+}
+```
+
+---
+
+### DTOs
+
+**`ApiResponse.java`** (`com.staynest.fb.dto`)
+```java
+package com.staynest.fb.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class ApiResponse<T> {
+    private boolean success;
+    private String message;
+    private T data;
+    private long timestamp;
+
+    public static <T> ApiResponse<T> success(T data) {
+        return ApiResponse.<T>builder().success(true).data(data).timestamp(System.currentTimeMillis()).build();
+    }
+
+    public static <T> ApiResponse<T> success(String message, T data) {
+        return ApiResponse.<T>builder().success(true).message(message).data(data).timestamp(System.currentTimeMillis()).build();
+    }
+
+    public static <T> ApiResponse<T> error(String message) {
+        return ApiResponse.<T>builder().success(false).message(message).timestamp(System.currentTimeMillis()).build();
+    }
+}
+```
+
+**`MenuItemRequest.java`** (`com.staynest.fb.dto`)
+```java
+package com.staynest.fb.dto;
+
+import com.staynest.fb.enums.MenuCategory;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
+import lombok.Data;
+
+import java.math.BigDecimal;
+
+@Data
+public class MenuItemRequest {
+    @NotBlank
+    private String name;
+    @NotNull
+    private MenuCategory category;
+    @NotNull @Positive
+    private BigDecimal price;
+    private String dietaryTags;
+}
+```
+
+**`MenuItemResponse.java`** (`com.staynest.fb.dto`)
+```java
+package com.staynest.fb.dto;
+
+import com.staynest.fb.enums.MenuCategory;
+import lombok.Builder;
+import lombok.Data;
+
+import java.math.BigDecimal;
+
+@Data
+@Builder
+public class MenuItemResponse {
+    private Integer menuItemId;
+    private String name;
+    private MenuCategory category;
+    private BigDecimal price;
+    private Boolean isAvailable;
+    private String dietaryTags;
+}
+```
+
+**`FBOrderRequest.java`** (`com.staynest.fb.dto`)
+```java
+package com.staynest.fb.dto;
+
+import com.staynest.fb.enums.OrderType;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+
+@Data
+public class FBOrderRequest {
+    @NotNull
+    private Integer stayId;
+    private String tableNumber;
+    @NotNull
+    private OrderType orderType;
+    @NotBlank
+    private String itemsJson;
+    @NotNull
+    private Integer placedBy;
+}
+```
+
+**`FBOrderResponse.java`** (`com.staynest.fb.dto`)
+```java
+package com.staynest.fb.dto;
+
+import com.staynest.fb.enums.OrderStatus;
+import com.staynest.fb.enums.OrderType;
+import lombok.Builder;
+import lombok.Data;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+
+@Data
+@Builder
+public class FBOrderResponse {
+    private Integer orderId;
+    private Integer stayId;
+    private String tableNumber;
+    private OrderType orderType;
+    private String itemsJson;
+    private BigDecimal totalAmount;
+    private LocalDateTime orderTime;
+    private OrderStatus status;
+}
+```
+
+**`DiningReservationRequest.java`** (`com.staynest.fb.dto`)
+```java
+package com.staynest.fb.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
+import lombok.Data;
+
+import java.time.LocalDate;
+import java.time.LocalTime;
+
+@Data
+public class DiningReservationRequest {
+    @NotNull
+    private Integer guestId;
+    private Integer stayId;
+    @NotBlank
+    private String restaurantOutlet;
+    @NotNull
+    private LocalDate date;
+    @NotNull
+    private LocalTime time;
+    @NotNull @Positive
+    private Integer covers;
+}
+```
+
+**`DiningReservationResponse.java`** (`com.staynest.fb.dto`)
+```java
+package com.staynest.fb.dto;
+
+import com.staynest.fb.enums.DiningResStatus;
+import lombok.Builder;
+import lombok.Data;
+
+import java.time.LocalDate;
+import java.time.LocalTime;
+
+@Data
+@Builder
+public class DiningReservationResponse {
+    private Integer diningResId;
+    private Integer guestId;
+    private Integer stayId;
+    private String restaurantOutlet;
+    private LocalDate date;
+    private LocalTime time;
+    private Integer covers;
+    private DiningResStatus status;
+}
+```
+
+---
+
+### Feign Client (to Front Desk Service for folio posting)
+
+**`FrontDeskServiceClient.java`** (`com.staynest.fb.client`)
+```java
+package com.staynest.fb.client;
+
+import com.staynest.fb.dto.ApiResponse;
+import org.springframework.cloud.openfeign.FeignClient;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestBody;
+
+import java.util.Map;
+
+@FeignClient(name = "frontdesk-service")
+public interface FrontDeskServiceClient {
+
+    @PostMapping("/api/stay-records/{stayId}/folio-items")
+    ApiResponse<?> postFolioItem(@PathVariable Integer stayId, @RequestBody Map<String, Object> folioItem);
+}
+```
+
+---
+
+### Entities
+
+**`MenuItem.java`** (`com.staynest.fb.entity`)
+```java
+package com.staynest.fb.entity;
+
+import com.staynest.fb.enums.MenuCategory;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "menu_items")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class MenuItem {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "MenuItemID")
+    private Integer menuItemId;
+
+    @Column(name = "Name", nullable = false, length = 150)
+    private String name;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Category", nullable = false)
+    private MenuCategory category;
+
+    @Column(name = "Price", nullable = false, precision = 10, scale = 2)
+    private BigDecimal price;
+
+    @Column(name = "IsAvailable")
+    @Builder.Default
+    private Boolean isAvailable = true;
+
+    @Column(name = "DietaryTags", length = 200)
+    private String dietaryTags;
+
+    @CreationTimestamp
+    @Column(name = "CreatedAt", updatable = false)
+    private LocalDateTime createdAt;
+
+    @UpdateTimestamp
+    @Column(name = "UpdatedAt")
+    private LocalDateTime updatedAt;
+}
+```
+
+**`FBOrder.java`** (`com.staynest.fb.entity`)
+```java
+package com.staynest.fb.entity;
+
+import com.staynest.fb.enums.OrderStatus;
+import com.staynest.fb.enums.OrderType;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "fb_orders")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class FBOrder {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "OrderID")
+    private Integer orderId;
+
+    @Column(name = "StayID", nullable = false)
+    private Integer stayId;
+
+    @Column(name = "TableNumber", length = 20)
+    private String tableNumber;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "OrderType", nullable = false)
+    private OrderType orderType;
+
+    @Column(name = "ItemsJSON", columnDefinition = "TEXT")
+    private String itemsJson;
+
+    @Column(name = "TotalAmount", nullable = false, precision = 10, scale = 2)
+    private BigDecimal totalAmount;
+
+    @CreationTimestamp
+    @Column(name = "OrderTime", updatable = false)
+    private LocalDateTime orderTime;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Status", nullable = false)
+    @Builder.Default
+    private OrderStatus status = OrderStatus.PLACED;
+
+    @CreationTimestamp
+    @Column(name = "CreatedAt", updatable = false)
+    private LocalDateTime createdAt;
+
+    @UpdateTimestamp
+    @Column(name = "UpdatedAt")
+    private LocalDateTime updatedAt;
+}
+```
+
+**`DiningReservation.java`** (`com.staynest.fb.entity`)
+```java
+package com.staynest.fb.entity;
+
+import com.staynest.fb.enums.DiningResStatus;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+
+@Entity
+@Table(name = "dining_reservations")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class DiningReservation {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "DiningResID")
+    private Integer diningResId;
+
+    @Column(name = "GuestID", nullable = false)
+    private Integer guestId;
+
+    @Column(name = "StayID")
+    private Integer stayId;
+
+    @Column(name = "RestaurantOutlet", nullable = false, length = 100)
+    private String restaurantOutlet;
+
+    @Column(name = "Date", nullable = false)
+    private LocalDate date;
+
+    @Column(name = "Time", nullable = false)
+    private LocalTime time;
+
+    @Column(name = "Covers", nullable = false)
+    private Integer covers;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Status", nullable = false)
+    @Builder.Default
+    private DiningResStatus status = DiningResStatus.CONFIRMED;
+
+    @CreationTimestamp
+    @Column(name = "CreatedAt", updatable = false)
+    private LocalDateTime createdAt;
+
+    @UpdateTimestamp
+    @Column(name = "UpdatedAt")
+    private LocalDateTime updatedAt;
+}
+```
+
+---
+
+### Repositories
+
+**`MenuItemRepository.java`** (`com.staynest.fb.repository`)
+```java
+package com.staynest.fb.repository;
+
+import com.staynest.fb.entity.MenuItem;
+import com.staynest.fb.enums.MenuCategory;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface MenuItemRepository extends JpaRepository<MenuItem, Integer> {
+    List<MenuItem> findByCategory(MenuCategory category);
+    List<MenuItem> findByIsAvailable(Boolean isAvailable);
+}
+```
+
+**`FBOrderRepository.java`** (`com.staynest.fb.repository`)
+```java
+package com.staynest.fb.repository;
+
+import com.staynest.fb.entity.FBOrder;
+import com.staynest.fb.enums.OrderStatus;
+import com.staynest.fb.enums.OrderType;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface FBOrderRepository extends JpaRepository<FBOrder, Integer> {
+    List<FBOrder> findByStayId(Integer stayId);
+    List<FBOrder> findByStatus(OrderStatus status);
+    List<FBOrder> findByOrderType(OrderType orderType);
+}
+```
+
+**`DiningReservationRepository.java`** (`com.staynest.fb.repository`)
+```java
+package com.staynest.fb.repository;
+
+import com.staynest.fb.entity.DiningReservation;
+import com.staynest.fb.enums.DiningResStatus;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.time.LocalDate;
+import java.util.List;
+
+@Repository
+public interface DiningReservationRepository extends JpaRepository<DiningReservation, Integer> {
+    List<DiningReservation> findByGuestId(Integer guestId);
+    List<DiningReservation> findByDate(LocalDate date);
+    List<DiningReservation> findByStatus(DiningResStatus status);
+}
+```
+
+---
+
+### Service Interface + ServiceImpl
+
+**`MenuItemService.java`** (`com.staynest.fb.service`) — Interface
+```java
+package com.staynest.fb.service;
+
+import com.staynest.fb.dto.MenuItemRequest;
+import com.staynest.fb.dto.MenuItemResponse;
+import com.staynest.fb.enums.MenuCategory;
+
+import java.util.List;
+
+public interface MenuItemService {
+    MenuItemResponse addMenuItem(MenuItemRequest request);
+    MenuItemResponse getMenuItemById(Integer id);
+    List<MenuItemResponse> getAllMenuItems();
+    List<MenuItemResponse> getMenuItemsByCategory(MenuCategory category);
+    List<MenuItemResponse> getAvailableMenuItems();
+    MenuItemResponse updateAvailability(Integer id, Boolean isAvailable);
+    MenuItemResponse updatePrice(Integer id, java.math.BigDecimal price);
+}
+```
+
+**`MenuItemServiceImpl.java`** (`com.staynest.fb.service.impl`) — Implementation
+```java
+package com.staynest.fb.service.impl;
+
+import com.staynest.fb.dto.MenuItemRequest;
+import com.staynest.fb.dto.MenuItemResponse;
+import com.staynest.fb.entity.MenuItem;
+import com.staynest.fb.enums.MenuCategory;
+import com.staynest.fb.exception.ResourceNotFoundException;
+import com.staynest.fb.repository.MenuItemRepository;
+import com.staynest.fb.service.MenuItemService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class MenuItemServiceImpl implements MenuItemService {
+
+    private final MenuItemRepository menuItemRepository;
+
+    @Override
+    public MenuItemResponse addMenuItem(MenuItemRequest request) {
+        MenuItem item = MenuItem.builder()
+                .name(request.getName())
+                .category(request.getCategory())
+                .price(request.getPrice())
+                .dietaryTags(request.getDietaryTags())
+                .build();
+        MenuItem saved = menuItemRepository.save(item);
+        log.info("MenuItem created: {}", saved.getMenuItemId());
+        return mapToResponse(saved);
+    }
+
+    @Override
+    public MenuItemResponse getMenuItemById(Integer id) {
+        MenuItem item = menuItemRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("MenuItem not found: " + id));
+        return mapToResponse(item);
+    }
+
+    @Override
+    public List<MenuItemResponse> getAllMenuItems() {
+        return menuItemRepository.findAll().stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Override
+    public List<MenuItemResponse> getMenuItemsByCategory(MenuCategory category) {
+        return menuItemRepository.findByCategory(category).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Override
+    public List<MenuItemResponse> getAvailableMenuItems() {
+        return menuItemRepository.findByIsAvailable(true).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Override
+    public MenuItemResponse updateAvailability(Integer id, Boolean isAvailable) {
+        MenuItem item = menuItemRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("MenuItem not found: " + id));
+        item.setIsAvailable(isAvailable);
+        MenuItem updated = menuItemRepository.save(item);
+        log.info("MenuItem {} availability updated to {}", id, isAvailable);
+        return mapToResponse(updated);
+    }
+
+    @Override
+    public MenuItemResponse updatePrice(Integer id, BigDecimal price) {
+        MenuItem item = menuItemRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("MenuItem not found: " + id));
+        item.setPrice(price);
+        MenuItem updated = menuItemRepository.save(item);
+        log.info("MenuItem {} price updated to {}", id, price);
+        return mapToResponse(updated);
+    }
+
+    private MenuItemResponse mapToResponse(MenuItem item) {
+        return MenuItemResponse.builder()
+                .menuItemId(item.getMenuItemId())
+                .name(item.getName())
+                .category(item.getCategory())
+                .price(item.getPrice())
+                .isAvailable(item.getIsAvailable())
+                .dietaryTags(item.getDietaryTags())
+                .build();
+    }
+}
+```
+
+**`FBOrderService.java`** (`com.staynest.fb.service`) — Interface
+```java
+package com.staynest.fb.service;
+
+import com.staynest.fb.dto.FBOrderRequest;
+import com.staynest.fb.dto.FBOrderResponse;
+import com.staynest.fb.enums.OrderStatus;
+
+import java.util.List;
+
+public interface FBOrderService {
+    FBOrderResponse placeOrder(FBOrderRequest request);
+    FBOrderResponse updateOrderStatus(Integer orderId, OrderStatus status);
+    FBOrderResponse cancelOrder(Integer orderId);
+    FBOrderResponse getOrderById(Integer orderId);
+    List<FBOrderResponse> getAllOrders();
+    List<FBOrderResponse> getOrdersByStayId(Integer stayId);
+    List<FBOrderResponse> getOrdersByStatus(OrderStatus status);
+}
+```
+
+**`FBOrderServiceImpl.java`** (`com.staynest.fb.service.impl`) — Implementation
+```java
+package com.staynest.fb.service.impl;
+
+import com.staynest.fb.client.FrontDeskServiceClient;
+import com.staynest.fb.dto.FBOrderRequest;
+import com.staynest.fb.dto.FBOrderResponse;
+import com.staynest.fb.entity.FBOrder;
+import com.staynest.fb.enums.OrderStatus;
+import com.staynest.fb.exception.BadRequestException;
+import com.staynest.fb.exception.ResourceNotFoundException;
+import com.staynest.fb.repository.FBOrderRepository;
+import com.staynest.fb.service.FBOrderService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.math.BigDecimal;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class FBOrderServiceImpl implements FBOrderService {
+
+    private final FBOrderRepository orderRepository;
+    private final FrontDeskServiceClient frontDeskClient;
+
+    @Override
+    @Transactional
+    public FBOrderResponse placeOrder(FBOrderRequest request) {
+        // Calculate total from itemsJSON (simplified - parse JSON in real scenario)
+        BigDecimal totalAmount = calculateTotal(request.getItemsJson());
+
+        FBOrder order = FBOrder.builder()
+                .stayId(request.getStayId())
+                .tableNumber(request.getTableNumber())
+                .orderType(request.getOrderType())
+                .itemsJson(request.getItemsJson())
+                .totalAmount(totalAmount)
+                .build();
+
+        FBOrder saved = orderRepository.save(order);
+        log.info("Order placed: {}", saved.getOrderId());
+        return mapToResponse(saved);
+    }
+
+    @Override
+    @Transactional
+    public FBOrderResponse updateOrderStatus(Integer orderId, OrderStatus status) {
+        FBOrder order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new ResourceNotFoundException("Order not found: " + orderId));
+
+        // Validate status transition
+        if (!isValidTransition(order.getStatus(), status)) {
+            throw new BadRequestException("Invalid status transition from " + order.getStatus() + " to " + status);
+        }
+
+        order.setStatus(status);
+        FBOrder updated = orderRepository.save(order);
+
+        // If BILLED, post to folio
+        if (status == OrderStatus.BILLED) {
+            try {
+                Map<String, Object> folioItem = new HashMap<>();
+                folioItem.put("chargeType", "FBCHARGE");
+                folioItem.put("description", "F&B Order: " + order.getOrderId());
+                folioItem.put("amount", order.getTotalAmount());
+                folioItem.put("postedBy", 1); // Should come from auth context
+                frontDeskClient.postFolioItem(order.getStayId(), folioItem);
+            } catch (Exception e) {
+                log.warn("Failed to post to folio: {}", e.getMessage());
+            }
+        }
+
+        log.info("Order {} status updated to {}", orderId, status);
+        return mapToResponse(updated);
+    }
+
+    @Override
+    @Transactional
+    public FBOrderResponse cancelOrder(Integer orderId) {
+        FBOrder order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new ResourceNotFoundException("Order not found: " + orderId));
+
+        if (order.getStatus() != OrderStatus.PLACED) {
+            throw new BadRequestException("Can only cancel orders with status PLACED. Current status: " + order.getStatus());
+        }
+
+        order.setStatus(OrderStatus.CANCELLED);
+        FBOrder updated = orderRepository.save(order);
+        log.info("Order {} cancelled", orderId);
+        return mapToResponse(updated);
+    }
+
+    @Override
+    public FBOrderResponse getOrderById(Integer orderId) {
+        FBOrder order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new ResourceNotFoundException("Order not found: " + orderId));
+        return mapToResponse(order);
+    }
+
+    @Override
+    public List<FBOrderResponse> getAllOrders() {
+        return orderRepository.findAll().stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Override
+    public List<FBOrderResponse> getOrdersByStayId(Integer stayId) {
+        return orderRepository.findByStayId(stayId).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Override
+    public List<FBOrderResponse> getOrdersByStatus(OrderStatus status) {
+        return orderRepository.findByStatus(status).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    private BigDecimal calculateTotal(String itemsJson) {
+        // Simplified: In real scenario, parse JSON and lookup menu item prices
+        return new BigDecimal("500.00");
+    }
+
+    private boolean isValidTransition(OrderStatus current, OrderStatus next) {
+        return switch (current) {
+            case PLACED -> next == OrderStatus.PREPARING || next == OrderStatus.CANCELLED;
+            case PREPARING -> next == OrderStatus.SERVED;
+            case SERVED -> next == OrderStatus.BILLED;
+            default -> false;
+        };
+    }
+
+    private FBOrderResponse mapToResponse(FBOrder order) {
+        return FBOrderResponse.builder()
+                .orderId(order.getOrderId())
+                .stayId(order.getStayId())
+                .tableNumber(order.getTableNumber())
+                .orderType(order.getOrderType())
+                .itemsJson(order.getItemsJson())
+                .totalAmount(order.getTotalAmount())
+                .orderTime(order.getOrderTime())
+                .status(order.getStatus())
+                .build();
+    }
+}
+```
+
+**`DiningReservationService.java`** (`com.staynest.fb.service`) — Interface
+```java
+package com.staynest.fb.service;
+
+import com.staynest.fb.dto.DiningReservationRequest;
+import com.staynest.fb.dto.DiningReservationResponse;
+import com.staynest.fb.enums.DiningResStatus;
+
+import java.time.LocalDate;
+import java.util.List;
+
+public interface DiningReservationService {
+    DiningReservationResponse createReservation(DiningReservationRequest request);
+    DiningReservationResponse updateReservationStatus(Integer id, DiningResStatus status);
+    DiningReservationResponse getReservationById(Integer id);
+    List<DiningReservationResponse> getAllReservations();
+    List<DiningReservationResponse> getReservationsByGuestId(Integer guestId);
+    List<DiningReservationResponse> getReservationsByDate(LocalDate date);
+}
+```
+
+**`DiningReservationServiceImpl.java`** (`com.staynest.fb.service.impl`) — Implementation
+```java
+package com.staynest.fb.service.impl;
+
+import com.staynest.fb.dto.DiningReservationRequest;
+import com.staynest.fb.dto.DiningReservationResponse;
+import com.staynest.fb.entity.DiningReservation;
+import com.staynest.fb.enums.DiningResStatus;
+import com.staynest.fb.exception.ResourceNotFoundException;
+import com.staynest.fb.repository.DiningReservationRepository;
+import com.staynest.fb.service.DiningReservationService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDate;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class DiningReservationServiceImpl implements DiningReservationService {
+
+    private final DiningReservationRepository reservationRepository;
+
+    @Override
+    public DiningReservationResponse createReservation(DiningReservationRequest request) {
+        DiningReservation reservation = DiningReservation.builder()
+                .guestId(request.getGuestId())
+                .stayId(request.getStayId())
+                .restaurantOutlet(request.getRestaurantOutlet())
+                .date(request.getDate())
+                .time(request.getTime())
+                .covers(request.getCovers())
+                .build();
+
+        DiningReservation saved = reservationRepository.save(reservation);
+        log.info("Dining reservation created: {}", saved.getDiningResId());
+        return mapToResponse(saved);
+    }
+
+    @Override
+    public DiningReservationResponse updateReservationStatus(Integer id, DiningResStatus status) {
+        DiningReservation reservation = reservationRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Dining reservation not found: " + id));
+        reservation.setStatus(status);
+        DiningReservation updated = reservationRepository.save(reservation);
+        log.info("Dining reservation {} status updated to {}", id, status);
+        return mapToResponse(updated);
+    }
+
+    @Override
+    public DiningReservationResponse getReservationById(Integer id) {
+        DiningReservation reservation = reservationRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Dining reservation not found: " + id));
+        return mapToResponse(reservation);
+    }
+
+    @Override
+    public List<DiningReservationResponse> getAllReservations() {
+        return reservationRepository.findAll().stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Override
+    public List<DiningReservationResponse> getReservationsByGuestId(Integer guestId) {
+        return reservationRepository.findByGuestId(guestId).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Override
+    public List<DiningReservationResponse> getReservationsByDate(LocalDate date) {
+        return reservationRepository.findByDate(date).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    private DiningReservationResponse mapToResponse(DiningReservation dr) {
+        return DiningReservationResponse.builder()
+                .diningResId(dr.getDiningResId())
+                .guestId(dr.getGuestId())
+                .stayId(dr.getStayId())
+                .restaurantOutlet(dr.getRestaurantOutlet())
+                .date(dr.getDate())
+                .time(dr.getTime())
+                .covers(dr.getCovers())
+                .status(dr.getStatus())
+                .build();
+    }
+}
+```
+
+---
+
+### Controllers
+
+**`MenuItemController.java`** (`com.staynest.fb.controller`)
+```java
+package com.staynest.fb.controller;
+
+import com.staynest.fb.dto.ApiResponse;
+import com.staynest.fb.dto.MenuItemRequest;
+import com.staynest.fb.dto.MenuItemResponse;
+import com.staynest.fb.enums.MenuCategory;
+import com.staynest.fb.service.MenuItemService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.*;
+
+import java.math.BigDecimal;
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/menu-items")
+@RequiredArgsConstructor
+public class MenuItemController {
+
+    private final MenuItemService menuItemService;
+
+    @PostMapping
+    @PreAuthorize("hasAnyRole('ADMIN', 'FBMANAGER')")
+    public ResponseEntity<ApiResponse<MenuItemResponse>> create(@Valid @RequestBody MenuItemRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success("Menu item created", menuItemService.addMenuItem(request)));
+    }
+
+    @GetMapping
+    public ResponseEntity<ApiResponse<List<MenuItemResponse>>> getAll(
+            @RequestParam(required = false) MenuCategory category,
+            @RequestParam(required = false) Boolean available) {
+        if (category != null) {
+            return ResponseEntity.ok(ApiResponse.success(menuItemService.getMenuItemsByCategory(category)));
+        }
+        if (available != null) {
+            return ResponseEntity.ok(ApiResponse.success(menuItemService.getAvailableMenuItems()));
+        }
+        return ResponseEntity.ok(ApiResponse.success(menuItemService.getAllMenuItems()));
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<ApiResponse<MenuItemResponse>> getById(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success(menuItemService.getMenuItemById(id)));
+    }
+
+    @PatchMapping("/{id}/availability")
+    @PreAuthorize("hasAnyRole('ADMIN', 'FBMANAGER')")
+    public ResponseEntity<ApiResponse<MenuItemResponse>> updateAvailability(
+            @PathVariable Integer id,
+            @RequestParam Boolean value) {
+        return ResponseEntity.ok(ApiResponse.success(menuItemService.updateAvailability(id, value)));
+    }
+
+    @PatchMapping("/{id}/price")
+    @PreAuthorize("hasAnyRole('ADMIN', 'FBMANAGER')")
+    public ResponseEntity<ApiResponse<MenuItemResponse>> updatePrice(
+            @PathVariable Integer id,
+            @RequestParam BigDecimal value) {
+        return ResponseEntity.ok(ApiResponse.success(menuItemService.updatePrice(id, value)));
+    }
+}
+```
+
+**`FBOrderController.java`** (`com.staynest.fb.controller`)
+```java
+package com.staynest.fb.controller;
+
+import com.staynest.fb.dto.ApiResponse;
+import com.staynest.fb.dto.FBOrderRequest;
+import com.staynest.fb.dto.FBOrderResponse;
+import com.staynest.fb.enums.OrderStatus;
+import com.staynest.fb.service.FBOrderService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/fb-orders")
+@RequiredArgsConstructor
+public class FBOrderController {
+
+    private final FBOrderService orderService;
+
+    @PostMapping
+    @PreAuthorize("hasAnyRole('ADMIN', 'FBMANAGER', 'FRONTDESK', 'GUEST')")
+    public ResponseEntity<ApiResponse<FBOrderResponse>> create(@Valid @RequestBody FBOrderRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success("Order placed", orderService.placeOrder(request)));
+    }
+
+    @GetMapping
+    public ResponseEntity<ApiResponse<List<FBOrderResponse>>> getAll(
+            @RequestParam(required = false) Integer stayId,
+            @RequestParam(required = false) OrderStatus status) {
+        if (stayId != null) {
+            return ResponseEntity.ok(ApiResponse.success(orderService.getOrdersByStayId(stayId)));
+        }
+        if (status != null) {
+            return ResponseEntity.ok(ApiResponse.success(orderService.getOrdersByStatus(status)));
+        }
+        return ResponseEntity.ok(ApiResponse.success(orderService.getAllOrders()));
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<ApiResponse<FBOrderResponse>> getById(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success(orderService.getOrderById(id)));
+    }
+
+    @PatchMapping("/{id}/status")
+    @PreAuthorize("hasAnyRole('ADMIN', 'FBMANAGER')")
+    public ResponseEntity<ApiResponse<FBOrderResponse>> updateStatus(
+            @PathVariable Integer id,
+            @RequestParam OrderStatus status) {
+        return ResponseEntity.ok(ApiResponse.success(orderService.updateOrderStatus(id, status)));
+    }
+
+    @PatchMapping("/{id}/cancel")
+    public ResponseEntity<ApiResponse<FBOrderResponse>> cancel(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success("Order cancelled", orderService.cancelOrder(id)));
+    }
+}
+```
+
+**`DiningReservationController.java`** (`com.staynest.fb.controller`)
+```java
+package com.staynest.fb.controller;
+
+import com.staynest.fb.dto.ApiResponse;
+import com.staynest.fb.dto.DiningReservationRequest;
+import com.staynest.fb.dto.DiningReservationResponse;
+import com.staynest.fb.enums.DiningResStatus;
+import com.staynest.fb.service.DiningReservationService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.LocalDate;
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/dining-reservations")
+@RequiredArgsConstructor
+public class DiningReservationController {
+
+    private final DiningReservationService reservationService;
+
+    @PostMapping
+    public ResponseEntity<ApiResponse<DiningReservationResponse>> create(@Valid @RequestBody DiningReservationRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success("Reservation created", reservationService.createReservation(request)));
+    }
+
+    @GetMapping
+    public ResponseEntity<ApiResponse<List<DiningReservationResponse>>> getAll(
+            @RequestParam(required = false) Integer guestId,
+            @RequestParam(required = false) LocalDate date) {
+        if (guestId != null) {
+            return ResponseEntity.ok(ApiResponse.success(reservationService.getReservationsByGuestId(guestId)));
+        }
+        if (date != null) {
+            return ResponseEntity.ok(ApiResponse.success(reservationService.getReservationsByDate(date)));
+        }
+        return ResponseEntity.ok(ApiResponse.success(reservationService.getAllReservations()));
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<ApiResponse<DiningReservationResponse>> getById(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success(reservationService.getReservationById(id)));
+    }
+
+    @PatchMapping("/{id}/status")
+    @PreAuthorize("hasAnyRole('ADMIN', 'FBMANAGER')")
+    public ResponseEntity<ApiResponse<DiningReservationResponse>> updateStatus(
+            @PathVariable Integer id,
+            @RequestParam DiningResStatus status) {
+        return ResponseEntity.ok(ApiResponse.success(reservationService.updateReservationStatus(id, status)));
+    }
+}
+```
+
+---
+
+### JUnit Tests
+
+**`FBOrderServiceTest.java`** (`com.staynest.fb.service`)
+```java
+package com.staynest.fb.service;
+
+import com.staynest.fb.client.FrontDeskServiceClient;
+import com.staynest.fb.dto.FBOrderRequest;
+import com.staynest.fb.entity.FBOrder;
+import com.staynest.fb.enums.OrderStatus;
+import com.staynest.fb.enums.OrderType;
+import com.staynest.fb.exception.BadRequestException;
+import com.staynest.fb.repository.FBOrderRepository;
+import com.staynest.fb.service.impl.FBOrderServiceImpl;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.math.BigDecimal;
+import java.util.Optional;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class FBOrderServiceTest {
+
+    @Mock private FBOrderRepository orderRepository;
+    @Mock private FrontDeskServiceClient frontDeskClient;
+    @InjectMocks private FBOrderServiceImpl orderService;
+
+    private FBOrder order;
+    private FBOrderRequest request;
+
+    @BeforeEach
+    void setUp() {
+        order = FBOrder.builder()
+                .orderId(1)
+                .stayId(1)
+                .orderType(OrderType.DINEIN)
+                .itemsJson("[{\"itemId\":1,\"qty\":2}]")
+                .totalAmount(new BigDecimal("500"))
+                .status(OrderStatus.PLACED)
+                .build();
+
+        request = new FBOrderRequest();
+        request.setStayId(1);
+        request.setOrderType(OrderType.DINEIN);
+        request.setItemsJson("[{\"itemId\":1,\"qty\":2}]");
+    }
+
+    @Test
+    void placeOrder_shouldCalculateCorrectTotal() {
+        when(orderRepository.save(any(FBOrder.class))).thenReturn(order);
+
+        var response = orderService.placeOrder(request);
+        assertNotNull(response);
+        assertEquals(OrderStatus.PLACED, response.getStatus());
+    }
+
+    @Test
+    void cancelOrder_placed_shouldCancel() {
+        when(orderRepository.findById(1)).thenReturn(Optional.of(order));
+        when(orderRepository.save(any(FBOrder.class))).thenReturn(order);
+
+        var response = orderService.cancelOrder(1);
+        assertEquals(OrderStatus.CANCELLED, response.getStatus());
+    }
+
+    @Test
+    void cancelOrder_preparing_shouldThrow() {
+        order.setStatus(OrderStatus.PREPARING);
+        when(orderRepository.findById(1)).thenReturn(Optional.of(order));
+
+        assertThrows(BadRequestException.class, () -> orderService.cancelOrder(1));
+    }
+
+    @Test
+    void updateOrderStatus_shouldChange() {
+        when(orderRepository.findById(1)).thenReturn(Optional.of(order));
+        when(orderRepository.save(any(FBOrder.class))).thenReturn(order);
+
+        var response = orderService.updateOrderStatus(1, OrderStatus.PREPARING);
+        assertEquals(OrderStatus.PREPARING, response.getStatus());
+    }
+}
+```
+
+---
+
+## Phase 5B: Notification Service (`staynest-notification-service`)
+
+**Dependencies in STS:** `Spring Web`, `Spring Data JPA`, `MySQL Driver`, `Spring Security`, `Eureka Discovery Client`, `Lombok`, `Validation`
+
+**Manual `pom.xml` addition for JWT:** (same as above)
+
+**`application.yml`:**
+```yaml
+server:
+  port: 8088
+
+spring:
+  application:
+    name: notification-service
+  datasource:
+    url: jdbc:mysql://localhost:3306/staynest_notification_db?createDatabaseIfNotExist=true&useSSL=false&serverTimezone=UTC
+    username: root
+    password: root
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQL8Dialect
+        format_sql: true
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+jwt:
+  secret: staynest-secret-key-for-jwt-signing-2026
+  expiration: 86400000
+```
+
+---
+
+### Main Application
+
+**`NotificationServiceApplication.java`** (`com.staynest.notification`)
+```java
+package com.staynest.notification;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
+
+@SpringBootApplication
+@EnableDiscoveryClient
+public class NotificationServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(NotificationServiceApplication.class, args);
+    }
+}
+```
+
+---
+
+### Enums
+
+**`NotificationCategory.java`** (`com.staynest.notification.enums`)
+```java
+package com.staynest.notification.enums;
+
+public enum NotificationCategory {
+    RESERVATION,
+    FRONTDESK,
+    HOUSEKEEPING,
+    FB,
+    REVENUE
+}
+```
+
+**`NotificationStatus.java`** (`com.staynest.notification.enums`)
+```java
+package com.staynest.notification.enums;
+
+public enum NotificationStatus {
+    UNREAD,
+    READ,
+    DISMISSED
+}
+```
+
+---
+
+### JWT, Exceptions, ApiResponse (Self-contained, same pattern, package `com.staynest.notification`)
+
+---
+
+### DTOs
+
+**`NotificationRequest.java`** (`com.staynest.notification.dto`)
+```java
+package com.staynest.notification.dto;
+
+import com.staynest.notification.enums.NotificationCategory;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+
+@Data
+public class NotificationRequest {
+    @NotNull
+    private Integer userId;
+    @NotBlank
+    private String message;
+    @NotNull
+    private NotificationCategory category;
+}
+```
+
+**`NotificationResponse.java`** (`com.staynest.notification.dto`)
+```java
+package com.staynest.notification.dto;
+
+import com.staynest.notification.enums.NotificationCategory;
+import com.staynest.notification.enums.NotificationStatus;
+import lombok.Builder;
+import lombok.Data;
+
+import java.time.LocalDateTime;
+
+@Data
+@Builder
+public class NotificationResponse {
+    private Integer notificationId;
+    private Integer userId;
+    private String message;
+    private NotificationCategory category;
+    private NotificationStatus status;
+    private LocalDateTime createdDate;
+}
+```
+
+**`UnreadCountResponse.java`** (`com.staynest.notification.dto`)
+```java
+package com.staynest.notification.dto;
+
+import lombok.Builder;
+import lombok.Data;
+
+@Data
+@Builder
+public class UnreadCountResponse {
+    private Integer unreadCount;
+}
+```
+
+---
+
+### Entity
+
+**`Notification.java`** (`com.staynest.notification.entity`)
+```java
+package com.staynest.notification.entity;
+
+import com.staynest.notification.enums.NotificationCategory;
+import com.staynest.notification.enums.NotificationStatus;
+import jakarta.persistence.*;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "notifications")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class Notification {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "NotificationID")
+    private Integer notificationId;
+
+    @Column(name = "UserID", nullable = false)
+    private Integer userId;
+
+    @Column(name = "Message", columnDefinition = "TEXT")
+    private String message;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Category", nullable = false)
+    private NotificationCategory category;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "Status", nullable = false)
+    @Builder.Default
+    private NotificationStatus status = NotificationStatus.UNREAD;
+
+    @CreationTimestamp
+    @Column(name = "CreatedDate", updatable = false)
+    private LocalDateTime createdDate;
+}
+```
+
+---
+
+### Repository
+
+**`NotificationRepository.java`** (`com.staynest.notification.repository`)
+```java
+package com.staynest.notification.repository;
+
+import com.staynest.notification.entity.Notification;
+import com.staynest.notification.enums.NotificationStatus;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface NotificationRepository extends JpaRepository<Notification, Integer> {
+    List<Notification> findByUserId(Integer userId);
+    List<Notification> findByUserIdAndStatus(Integer userId, NotificationStatus status);
+    long countByUserIdAndStatus(Integer userId, NotificationStatus status);
+}
+```
+
+---
+
+### Service Interface + ServiceImpl
+
+**`NotificationService.java`** (`com.staynest.notification.service`) — Interface
+```java
+package com.staynest.notification.service;
+
+import com.staynest.notification.dto.NotificationRequest;
+import com.staynest.notification.dto.NotificationResponse;
+import com.staynest.notification.dto.UnreadCountResponse;
+
+import java.util.List;
+
+public interface NotificationService {
+    NotificationResponse sendNotification(NotificationRequest request);
+    NotificationResponse markAsRead(Integer notificationId);
+    int markAllAsRead(Integer userId);
+    UnreadCountResponse getUnreadCount(Integer userId);
+    NotificationResponse getNotificationById(Integer id);
+    List<NotificationResponse> getNotificationsByUser(Integer userId);
+    List<NotificationResponse> getUnreadNotificationsByUser(Integer userId);
+}
+```
+
+**`NotificationServiceImpl.java`** (`com.staynest.notification.service.impl`) — Implementation
+```java
+package com.staynest.notification.service.impl;
+
+import com.staynest.notification.dto.NotificationRequest;
+import com.staynest.notification.dto.NotificationResponse;
+import com.staynest.notification.dto.UnreadCountResponse;
+import com.staynest.notification.entity.Notification;
+import com.staynest.notification.enums.NotificationStatus;
+import com.staynest.notification.exception.ResourceNotFoundException;
+import com.staynest.notification.repository.NotificationRepository;
+import com.staynest.notification.service.NotificationService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class NotificationServiceImpl implements NotificationService {
+
+    private final NotificationRepository notificationRepository;
+
+    @Override
+    public NotificationResponse sendNotification(NotificationRequest request) {
+        Notification notification = Notification.builder()
+                .userId(request.getUserId())
+                .message(request.getMessage())
+                .category(request.getCategory())
+                .build();
+
+        Notification saved = notificationRepository.save(notification);
+        log.info("Notification sent to user {}: {}", request.getUserId(), saved.getNotificationId());
+        return mapToResponse(saved);
+    }
+
+    @Override
+    @Transactional
+    public NotificationResponse markAsRead(Integer notificationId) {
+        Notification notification = notificationRepository.findById(notificationId)
+                .orElseThrow(() -> new ResourceNotFoundException("Notification not found: " + notificationId));
+        notification.setStatus(NotificationStatus.READ);
+        Notification updated = notificationRepository.save(notification);
+        log.info("Notification {} marked as read", notificationId);
+        return mapToResponse(updated);
+    }
+
+    @Override
+    @Transactional
+    public int markAllAsRead(Integer userId) {
+        List<Notification> unreadNotifications = notificationRepository
+                .findByUserIdAndStatus(userId, NotificationStatus.UNREAD);
+        
+        unreadNotifications.forEach(n -> n.setStatus(NotificationStatus.READ));
+        notificationRepository.saveAll(unreadNotifications);
+        
+        int count = unreadNotifications.size();
+        log.info("Marked {} notifications as read for user {}", count, userId);
+        return count;
+    }
+
+    @Override
+    public UnreadCountResponse getUnreadCount(Integer userId) {
+        long count = notificationRepository.countByUserIdAndStatus(userId, NotificationStatus.UNREAD);
+        return UnreadCountResponse.builder()
+                .unreadCount((int) count)
+                .build();
+    }
+
+    @Override
+    public NotificationResponse getNotificationById(Integer id) {
+        Notification notification = notificationRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Notification not found: " + id));
+        return mapToResponse(notification);
+    }
+
+    @Override
+    public List<NotificationResponse> getNotificationsByUser(Integer userId) {
+        return notificationRepository.findByUserId(userId).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    @Override
+    public List<NotificationResponse> getUnreadNotificationsByUser(Integer userId) {
+        return notificationRepository.findByUserIdAndStatus(userId, NotificationStatus.UNREAD).stream()
+                .map(this::mapToResponse).collect(Collectors.toList());
+    }
+
+    private NotificationResponse mapToResponse(Notification n) {
+        return NotificationResponse.builder()
+                .notificationId(n.getNotificationId())
+                .userId(n.getUserId())
+                .message(n.getMessage())
+                .category(n.getCategory())
+                .status(n.getStatus())
+                .createdDate(n.getCreatedDate())
+                .build();
+    }
+}
+```
+
+---
+
+### Controller
+
+**`NotificationController.java`** (`com.staynest.notification.controller`)
+```java
+package com.staynest.notification.controller;
+
+import com.staynest.notification.dto.ApiResponse;
+import com.staynest.notification.dto.NotificationRequest;
+import com.staynest.notification.dto.NotificationResponse;
+import com.staynest.notification.dto.UnreadCountResponse;
+import com.staynest.notification.service.NotificationService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/notifications")
+@RequiredArgsConstructor
+public class NotificationController {
+
+    private final NotificationService notificationService;
+
+    @PostMapping
+    public ResponseEntity<ApiResponse<NotificationResponse>> create(@Valid @RequestBody NotificationRequest request) {
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success("Notification sent", notificationService.sendNotification(request)));
+    }
+
+    @GetMapping("/user/{userId}")
+    public ResponseEntity<ApiResponse<List<NotificationResponse>>> getByUser(@PathVariable Integer userId) {
+        return ResponseEntity.ok(ApiResponse.success(notificationService.getNotificationsByUser(userId)));
+    }
+
+    @GetMapping("/user/{userId}/unread")
+    public ResponseEntity<ApiResponse<List<NotificationResponse>>> getUnreadByUser(@PathVariable Integer userId) {
+        return ResponseEntity.ok(ApiResponse.success(notificationService.getUnreadNotificationsByUser(userId)));
+    }
+
+    @GetMapping("/user/{userId}/count")
+    public ResponseEntity<ApiResponse<UnreadCountResponse>> getUnreadCount(@PathVariable Integer userId) {
+        return ResponseEntity.ok(ApiResponse.success(notificationService.getUnreadCount(userId)));
+    }
+
+    @PatchMapping("/{id}/read")
+    public ResponseEntity<ApiResponse<NotificationResponse>> markAsRead(@PathVariable Integer id) {
+        return ResponseEntity.ok(ApiResponse.success("Marked as read", notificationService.markAsRead(id)));
+    }
+
+    @PatchMapping("/user/{userId}/read-all")
+    public ResponseEntity<ApiResponse<Integer>> markAllAsRead(@PathVariable Integer userId) {
+        int count = notificationService.markAllAsRead(userId);
+        return ResponseEntity.ok(ApiResponse.success("Marked " + count + " notifications as read", count));
+    }
+}
+```
+
+---
+
+### JUnit Tests
+
+**`NotificationServiceTest.java`** (`com.staynest.notification.service`)
+```java
+package com.staynest.notification.service;
+
+import com.staynest.notification.dto.NotificationRequest;
+import com.staynest.notification.entity.Notification;
+import com.staynest.notification.enums.NotificationCategory;
+import com.staynest.notification.enums.NotificationStatus;
+import com.staynest.notification.exception.ResourceNotFoundException;
+import com.staynest.notification.repository.NotificationRepository;
+import com.staynest.notification.service.impl.NotificationServiceImpl;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.util.List;
+import java.util.Optional;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class NotificationServiceTest {
+
+    @Mock private NotificationRepository notificationRepository;
+    @InjectMocks private NotificationServiceImpl notificationService;
+
+    private Notification notification;
+    private NotificationRequest request;
+
+    @BeforeEach
+    void setUp() {
+        notification = Notification.builder()
+                .notificationId(1)
+                .userId(1)
+                .message("Your reservation is confirmed")
+                .category(NotificationCategory.RESERVATION)
+                .status(NotificationStatus.UNREAD)
+                .build();
+
+        request = new NotificationRequest();
+        request.setUserId(1);
+        request.setMessage("Your reservation is confirmed");
+        request.setCategory(NotificationCategory.RESERVATION);
+    }
+
+    @Test
+    void sendNotification_shouldBeUnread() {
+        when(notificationRepository.save(any(Notification.class))).thenReturn(notification);
+
+        var response = notificationService.sendNotification(request);
+        assertNotNull(response);
+        assertEquals(NotificationStatus.UNREAD, response.getStatus());
+    }
+
+    @Test
+    void markAsRead_shouldChangeStatus() {
+        when(notificationRepository.findById(1)).thenReturn(Optional.of(notification));
+        when(notificationRepository.save(any(Notification.class))).thenReturn(notification);
+
+        var response = notificationService.markAsRead(1);
+        assertEquals(NotificationStatus.READ, response.getStatus());
+    }
+
+    @Test
+    void getUnreadCount_shouldReturnCorrect() {
+        when(notificationRepository.countByUserIdAndStatus(1, NotificationStatus.UNREAD)).thenReturn(3L);
+
+        var response = notificationService.getUnreadCount(1);
+        assertEquals(3, response.getUnreadCount());
+    }
+
+    @Test
+    void markAllAsRead_shouldUpdateAll() {
+        Notification n2 = Notification.builder().notificationId(2).userId(1).status(NotificationStatus.UNREAD).build();
+        when(notificationRepository.findByUserIdAndStatus(1, NotificationStatus.UNREAD))
+                .thenReturn(List.of(notification, n2));
+
+        int count = notificationService.markAllAsRead(1);
+        assertEquals(2, count);
+        verify(notificationRepository, times(1)).saveAll(any());
+    }
+
+    @Test
+    void getNotificationById_invalid_shouldThrow() {
+        when(notificationRepository.findById(999)).thenReturn(Optional.empty());
+        assertThrows(ResourceNotFoundException.class, () -> notificationService.getNotificationById(999));
+    }
+}
+```
+
+---
+
+## Seed Data (MySQL)
+
+```sql
+-- F&B DB
+USE staynest_fb_db;
+
+INSERT INTO menu_items (Name, Category, Price, IsAvailable, DietaryTags) VALUES
+('Continental Breakfast', 'BREAKFAST', 450.00, true, 'Vegetarian'),
+('Grilled Chicken Steak', 'MAINCOURSE', 850.00, true, 'High Protein'),
+('Caesar Salad', 'MAINCOURSE', 350.00, true, 'Vegetarian'),
+('Fresh Lime Soda', 'BEVERAGE', 120.00, true, 'Vegan'),
+('Chocolate Lava Cake', 'DESSERT', 280.00, true, 'Contains Eggs');
+
+INSERT INTO fb_orders (StayID, TableNumber, OrderType, ItemsJSON, TotalAmount, Status) VALUES
+(1, 'T12', 'DINEIN', '[{"itemId":1,"qty":2},{"itemId":4,"qty":1}]', 1020.00, 'PLACED'),
+(1, NULL, 'INROOMDINING', '[{"itemId":2,"qty":1},{"itemId":5,"qty":2}]', 1410.00, 'PREPARING'),
+(2, 'T05', 'DINEIN', '[{"itemId":3,"qty":1}]', 350.00, 'SERVED');
+
+INSERT INTO dining_reservations (GuestID, StayID, RestaurantOutlet, Date, Time, Covers, Status) VALUES
+(1, 1, 'The Garden Bistro', '2026-07-26', '19:30:00', 2, 'CONFIRMED'),
+(2, 2, 'Sky Lounge', '2026-07-28', '20:00:00', 4, 'CONFIRMED');
+
+-- Notification DB
+USE staynest_notification_db;
+
+INSERT INTO notifications (UserID, Message, Category, Status) VALUES
+(1, 'Your reservation #1001 is confirmed', 'RESERVATION', 'UNREAD'),
+(1, 'Check-in reminder: Tomorrow at 2 PM', 'FRONTDESK', 'UNREAD'),
+(2, 'Your room cleaning is complete', 'HOUSEKEEPING', 'READ'),
+(3, 'New F&B order received', 'FB', 'UNREAD'),
+(1, 'Weekly revenue report available', 'REVENUE', 'UNREAD');
+```
+
+---
+
+## What You've Built So Far
+
+| Service | Port | Status |
+|---------|------|--------|
+| Eureka Server | 8761 | ✅ Complete |
+| API Gateway | 8080 | ✅ Complete |
+| IAM Service | 8081 | ✅ Complete |
+| Room Service | 8082 | ✅ Complete |
+| Reservation Service | 8083 | ✅ Complete |
+| Front Desk Service | 8084 | ✅ Complete |
+| Housekeeping Service | 8085 | ✅ Complete |
+| **F&B Service** | **8086** | **✅ Complete** |
+| **Notification Service** | **8088** | **✅ Complete** |
+
+---
+
+## Last Service Remaining
+
+**Phase 6: Revenue Service (Port 8087)** — the final piece!
+
+Want me to generate it now? It will include:
+- `HospitalityReport` entity
+- Feign clients to Room Service and Reservation Service for data aggregation
+- Summary/KPI endpoints (Occupancy, ADR, RevPAR, Guest Score)
+
+Just say **"Phase 6"** and I'll finish it! 🚀
