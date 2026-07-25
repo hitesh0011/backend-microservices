@@ -1,0 +1,220 @@
+Here's your **Monolithic Frontend Plan** — one Vite React app with all 17 pages, integrated with your 8 backend microservices through the API Gateway.
+
+
+🏨 StayNest — Monolithic Frontend Plan
+
+Vite · React v18 · Bootstrap 5 · Axios · React Router DOM v6
+Single Vite App 17 Pages 12 Components API Gateway:8080
+📐 Architecture
+⚡ Vite React App (localhost:5173)
+Single Monolithic Frontend
+17 Pages · 12 Components · 1 AuthContext
+▼ Axios requests via api.js ▼
+🔀 API Gateway
+localhost:8080
+▼ routes to 8 backend services ▼
+IAM (8081)
+Room (8082)
+Reservation (8083)
+FrontDesk (8084)
+Housekeeping (8085)
+F&B (8086)
+Revenue (8087)
+Notification (8088)
+📁 Project Structure
+
+staynest-frontend/
+├── public/
+│   └── index.html
+├── src/
+│   ├── main.jsx                 # Entry point (Vite)
+│   ├── App.jsx                  # Router with all routes
+│   ├── index.css                # Bootstrap import + custom styles
+│   │
+│   ├── context/
+│   │   └── AuthContext.jsx      # Global auth: token, user, role, login, logout
+│   │
+│   ├── services/
+│   │   └── api.js               # Axios instance: baseURL, Bearer interceptor
+│   │
+│   ├── components/
+│   │   ├── Layout.jsx           # Navbar + Sidebar wrapper
+│   │   ├── Navbar.jsx           # Top bar: brand, NotificationBell, user, logout
+│   │   ├── Sidebar.jsx          # Role-based navigation links
+│   │   ├── ProtectedRoute.jsx   # Route guard: auth check + role check
+│   │   ├── NotificationBell.jsx # Bell icon + unread count badge
+│   │   ├── UserFormModal.jsx
+│   │   ├── RoomTypeFormModal.jsx
+│   │   ├── RoomFormModal.jsx
+│   │   ├── RatePlanFormModal.jsx
+│   │   ├── RoomAssignModal.jsx
+│   │   ├── AddChargeModal.jsx
+│   │   ├── MenuItemFormModal.jsx
+│   │   ├── BookingConfirmModal.jsx
+│   │   └── GuestProfileFormModal.jsx
+│   │
+│   └── pages/
+│       ├── LoginPage.jsx
+│       ├── iam/
+│       │   └── UserListPage.jsx
+│       ├── ric/
+│       │   ├── RoomTypePage.jsx
+│       │   ├── RoomListPage.jsx
+│       │   ├── RatePlanPage.jsx
+│       │   └── AnalyticsDashboardPage.jsx
+│       ├── rbm/
+│       │   ├── BookingSearchPage.jsx
+│       │   ├── MyReservationsPage.jsx
+│       │   └── GuestProfilePage.jsx
+│       ├── fds/
+│       │   ├── FrontDeskPage.jsx
+│       │   └── StayDetailPage.jsx
+│       ├── hkm/
+│       │   ├── HousekeepingPage.jsx
+│       │   └── MaintenancePage.jsx
+│       ├── fbm/
+│       │   ├── MenuPage.jsx
+│       │   ├── FBOrderPage.jsx
+│       │   └── DiningReservationPage.jsx
+│       └── nal/
+│           └── NotificationsPage.jsx
+│
+├── index.html
+├── package.json
+├── vite.config.js
+└── README.md
+
+🗺️ Route Map
+🔓 Public
+/login → LoginPage (no auth needed)
+🔐 Admin Only
+/users → UserListPage  |  /room-types → RoomTypePage  |  /rooms → RoomListPage
+/rate-plans → RatePlanPage  |  /analytics → AnalyticsDashboardPage
+👤 Guest + All Staff
+/book → BookingSearchPage  |  /my-reservations → MyReservationsPage
+/profile → GuestProfilePage  |  /notifications → NotificationsPage
+🖥️ Front Desk + Admin
+/front-desk → FrontDeskPage  |  /stays/:stayId → StayDetailPage
+🧹 Housekeeping + Admin
+/housekeeping → HousekeepingPage  |  /maintenance → MaintenancePage
+🍽️ F&B Manager + Admin
+/menu → MenuPage  |  /orders → FBOrderPage
+/dining-reservations → DiningReservationPage
+
+📋 Phase 1: Foundation (What We'll Build Now)
+Step 1: Vite Project Setup
+npm create vite@latest staynest-frontend -- --template react
+cd staynest-frontend
+npm install
+npm install bootstrap react-bootstrap react-router-dom axios react-icons
+Step 2: Shared Infrastructure (6 files)
+1. main.jsx — Bootstrap CSS import, AuthContext provider, StrictMode
+2. index.css — Custom overrides for sidebar, cards, badges
+3. context/AuthContext.jsx — createContext, login/logout, useAuth hook, localStorage sync
+4. services/api.js — axios.create(baseURL: 'http://localhost:8080'), request interceptor for Bearer, response interceptor for 401
+5. components/ProtectedRoute.jsx — Check token → redirect /login. Check role → redirect /unauthorized
+6. App.jsx — BrowserRouter with all 17 routes, Layout wrapper, role-based route guards
+Step 3: Layout Components (3 files)
+7. components/Layout.jsx — Flexbox: Navbar (top) + Sidebar (left, 240px) + Main content (flex-1)
+8. components/Navbar.jsx — StayNest brand, NotificationBell (mock count=3), user dropdown (name + role + logout)
+9. components/Sidebar.jsx — Role-filtered nav links. Admin sees all. Guest sees book/my-reservations/profile. Each link is a React Router <Link> with active state styling
+Step 4: Login Page (1 file)
+10. pages/LoginPage.jsx — Centered card on gradient background. Email + Password inputs. Submit calls POST /api/auth/login. On success: store token+user in AuthContext + localStorage. Redirect based on role (Admin→/users, Guest→/book, etc.)
+Step 5: Placeholder Pages (17 files — empty shell)
+Create all 17 page files with a simple heading + "Coming Soon" message. This proves routing works and gives structure for Phase 2.
+
+IAM: UserListPage
+Room Config: RoomTypePage, RoomListPage, RatePlanPage, AnalyticsDashboardPage
+Reservation: BookingSearchPage, MyReservationsPage, GuestProfilePage
+Front Desk: FrontDeskPage, StayDetailPage
+Housekeeping: HousekeepingPage, MaintenancePage
+F&B: MenuPage, FBOrderPage, DiningReservationPage
+Notifications: NotificationsPage
+⚡ Vite Configuration
+vite.config.js needs CORS proxy for local development:
+
+export default {
+  server: {
+    port: 5173,
+    proxy: {
+      '/api': {
+        target: 'http://localhost:8080',
+        changeOrigin: true,
+      }
+    }
+  }
+}
+
+This lets you call /api/auth/login from frontend and Vite proxies it to the API Gateway.
+🔐 Auth Flow
+1. Login
+User submits form → POST /api/auth/login → Backend returns {token, role, userId, name}
+2. Store
+AuthContext stores token in localStorage + React state. Sidebar re-renders with role-based links.
+3. Request
+Every API call: axios interceptor reads token from localStorage → adds Authorization: Bearer header.
+4. Logout
+Click logout → clear localStorage → reset AuthContext → navigate to /login.
+🔗 Backend Integration Checklist
+Before Phase 1 works end-to-end, ensure backend is running:
+
+✅ Eureka Server on port 8761
+✅ API Gateway on port 8080 with all routes configured
+✅ IAM Service on port 8081 with seed users
+✅ CORS enabled on Gateway (allow localhost:5173)
+
+Test: curl http://localhost:8080/api/auth/login should work before frontend calls it.
+✅ What Phase 1 Delivers
+Functional
+• Login with real backend API
+• JWT token stored & sent on every request
+• Role-based route access
+• Logout clears everything
+• Sidebar shows only allowed links
+UI/UX
+• Bootstrap-styled login page
+• Responsive sidebar (collapsible)
+• Navbar with branding + user info
+• Active route highlighting
+• Notification bell icon
+Structure
+• All 17 page files created (placeholders)
+• All 12 component files created (placeholders)
+• Clean folder structure per module
+• Ready for Phase 2 (mock data)
+• Ready for Phase 3 (API integration)
+Ready to build Phase 1? 🚀
+I'll generate all code: Vite setup, AuthContext, api.js, Layout, Navbar, Sidebar, ProtectedRoute, App.jsx routing, LoginPage, and all 17 placeholder pages.
+
+
+## Key Points
+
+| Aspect | Decision |
+|--------|----------|
+| **Build Tool** | Vite (fast dev server, HMR) |
+| **Backend Integration** | Axios → API Gateway (localhost:8080) via Vite proxy |
+| **Auth** | JWT stored in localStorage, Bearer header on every request |
+| **Routing** | React Router v6 with role-based guards |
+| **Styling** | Bootstrap 5 + react-bootstrap |
+
+## Phase 1 Deliverables (6 steps, ~10 files)
+
+1. **Vite setup** + `vite.config.js` (CORS proxy)
+2. **`main.jsx`** — Bootstrap import + AuthContext provider
+3. **`context/AuthContext.jsx`** — login/logout/useAuth, localStorage sync
+4. **`services/api.js`** — axios with baseURL + Bearer interceptor
+5. **`components/`** — Layout, Navbar, Sidebar, ProtectedRoute
+6. **`App.jsx`** — all 17 routes with role guards
+7. **`pages/LoginPage.jsx`** — real backend login
+8. **17 placeholder pages** — one per route
+
+## Backend Prerequisites
+
+Before frontend works end-to-end:
+- Eureka (8761) + API Gateway (8080) running
+- IAM Service (8081) with seed users
+- Gateway CORS allows `localhost:5173`
+
+---
+
+**Ready to generate the code?** I'll build all of Phase 1 now — from `npm create vite` to the last placeholder page. 🚀
